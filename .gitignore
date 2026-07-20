@@ -1,0 +1,46 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+mcq/
+venv/
+.env/
+
+# pyenv / local settings
+.python-version
+
+# macOS
+.DS_Store
+
+# Databases (contain student data / local state)
+db26/*.db
+db26/*.db-journal
+*.db
+*.sqlite
+*.sqlite3
+
+# OAuth / email credentials and autosend config
+token.json
+credentials.json
+email_autosend.json
+
+# Test modules
+simple_test_quiz.py
+test_*.py
+
+# Quiz source documents and question banks (proprietary / sensitive)
+*.odt
+*.docx
+*.pdf
+notes/
+default_question_banks.txt
+
+# Local outputs / debug artifacts
+parsed_quizzes26/
+*.log
+*.png
+*.jpg
+*.jpeg

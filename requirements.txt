@@ -1,0 +1,34 @@
+# MCQ26 + bubbleSheet/MCQ requirements for Python 3.12
+# GUI
+PyQt6
+# Database
+SQLAlchemy
+# PDF generation and reading
+fpdf2
+PyMuPDF
+pypdf
+# ODT document generation
+odfpy
+# Image processing (bubble sheet scanning)
+opencv-python
+scikit-image
+Pillow
+# Numeric / scientific
+numpy
+scipy
+matplotlib
+pandas
+openpyxl
+# Google Gmail API
+google-api-python-client
+google-auth
+google-auth-httplib2
+google-auth-oauthlib
+# LLM API
+openai
+# Utilities
+python-dateutil
+python-barcode
+qrcode
+pyzbar
+natsort
