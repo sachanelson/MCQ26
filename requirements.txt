@@ -26,6 +26,8 @@ google-auth-httplib2
 google-auth-oauthlib
 # LLM API
 openai
+# Browser automation (Moodle Choice sync)
+playwright
 # Utilities
 python-dateutil
 python-barcode

@@ -20,8 +20,97 @@ from database26 import (
     get_semester_calendar, save_semester_calendar, compute_meeting_dates,
     get_all_classrooms, save_classroom, delete_classroom,
     get_section_meetings, save_section_meeting,
+    get_all_students, save_enrolled_students,
 )
 # Legacy module status text files deprecated; no import needed
+
+
+class EnrolledStudentsDialog(QDialog):
+    def __init__(self, engine, parent=None):
+        super().__init__(parent)
+        self.engine = engine
+        self._removed_student_ids = []
+        self.setWindowTitle('Manage Enrolled Students')
+        self.resize(700, 480)
+        layout = QVBoxLayout(self)
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(['Name', 'Code', 'Section'])
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(self.table)
+        buttons = QHBoxLayout()
+        remove_button = QPushButton('Remove Selected Student')
+        remove_button.clicked.connect(self._remove_selected_student)
+        buttons.addWidget(remove_button)
+        buttons.addStretch()
+        save_button = QPushButton('Save Students')
+        save_button.clicked.connect(self._save_students)
+        buttons.addWidget(save_button)
+        close_button = QPushButton('Close')
+        close_button.clicked.connect(self.reject)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+        self._load_students()
+
+    def _load_students(self):
+        self.table.setRowCount(0)
+        for student in get_all_students(self.engine):
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            name_item = QTableWidgetItem(student.name or '')
+            name_item.setData(Qt.ItemDataRole.UserRole, student.student_id)
+            self.table.setItem(row, 0, name_item)
+            self.table.setItem(row, 1, QTableWidgetItem(student.student_code or ''))
+            section = '' if student.section_number is None else str(student.section_number)
+            self.table.setItem(row, 2, QTableWidgetItem(section))
+
+    def _remove_selected_student(self):
+        row = self.table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, 'No Selection', 'Select a student to remove.')
+            return
+        name_item = self.table.item(row, 0)
+        name = name_item.text() if name_item else 'this student'
+        reply = QMessageBox.question(
+            self,
+            'Remove Student',
+            f"Remove {name} from the enrolled roster? Their database history and course files will be kept.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        student_id = name_item.data(Qt.ItemDataRole.UserRole) if name_item else None
+        if student_id is not None:
+            self._removed_student_ids.append(student_id)
+        self.table.removeRow(row)
+
+    def _save_students(self):
+        students = []
+        try:
+            for row in range(self.table.rowCount()):
+                name_item = self.table.item(row, 0)
+                code_item = self.table.item(row, 1)
+                section_item = self.table.item(row, 2)
+                section_text = section_item.text().strip() if section_item else ''
+                if section_text and not section_text.isdigit():
+                    raise ValueError(f"Section for row {row + 1} must be a whole number.")
+                students.append({
+                    'student_id': name_item.data(Qt.ItemDataRole.UserRole) if name_item else None,
+                    'name': name_item.text() if name_item else '',
+                    'student_code': code_item.text() if code_item else '',
+                    'section_number': int(section_text) if section_text else None,
+                })
+            save_enrolled_students(self.engine, students, self._removed_student_ids)
+        except Exception as error:
+            QMessageBox.warning(self, 'Could Not Save Students', str(error))
+            return
+        self._removed_student_ids = []
+        self._load_students()
+        QMessageBox.information(self, 'Students Saved', 'The enrolled-student roster was saved.')
 
 
 class CourseInfoPanel(QWidget):
@@ -45,6 +134,7 @@ class CourseInfoPanel(QWidget):
         self.course_title_value = ''
         self.instructors_value = ''
         self.course_folder_value = ''
+        self.moodle_url_value = ''
         self.min_signup_value = 24
         self.min_cancel_value = 24
 
@@ -106,6 +196,16 @@ class CourseInfoPanel(QWidget):
         folder_layout.addWidget(self.course_folder_input)
         folder_layout.addWidget(browse_btn)
         form_layout.addRow("Course Folder:", folder_layout)
+
+        moodle_layout = QHBoxLayout()
+        self.moodle_url_input = QLineEdit()
+        self.moodle_url_input.setMinimumWidth(400)
+        self.moodle_url_input.setPlaceholderText("https://moodle.example.edu/course/view.php?id=...")
+        moodle_layout.addWidget(self.moodle_url_input)
+        test_moodle_button = QPushButton("Test")
+        test_moodle_button.clicked.connect(self._open_moodle_url)
+        moodle_layout.addWidget(test_moodle_button)
+        form_layout.addRow("Course Moodle URL:", moodle_layout)
 
         # Signup / cancel time
         time_layout = QHBoxLayout()
@@ -199,6 +299,9 @@ class CourseInfoPanel(QWidget):
         import_roster_btn = QPushButton("Import Section Roster…")
         import_roster_btn.clicked.connect(self._import_section_roster)
         sec_btn_row.addWidget(import_roster_btn)
+        manage_students_btn = QPushButton('Manage Enrolled Students…')
+        manage_students_btn.clicked.connect(self._manage_enrolled_students)
+        sec_btn_row.addWidget(manage_students_btn)
         sec_btn_row.addStretch()
         layout.addLayout(sec_btn_row)
 
@@ -236,6 +339,14 @@ class CourseInfoPanel(QWidget):
         )
         if folder:
             self.course_folder_input.setText(folder)
+
+    def _open_moodle_url(self):
+        url = QUrl.fromUserInput(self.moodle_url_input.text().strip())
+        if not url.isValid() or url.scheme() not in ('http', 'https'):
+            QMessageBox.warning(self, 'Invalid Moodle URL', 'Enter a valid HTTP or HTTPS URL.')
+            return
+        if not QDesktopServices.openUrl(url):
+            QMessageBox.warning(self, 'Could Not Open Moodle', 'The browser could not open this URL.')
     
     def load_course_info(self):
         """Load course info from database26."""
@@ -247,6 +358,7 @@ class CourseInfoPanel(QWidget):
             self.course_title_input.setText(info.get('course_title', ''))
             self.instructors_input.setText(info.get('instructors', ''))
             self.course_folder_input.setText(info.get('course_folder', ''))
+            self.moodle_url_input.setText(info.get('moodle_url', ''))
             self.min_signup_input.setText(str(info.get('min_signup_time', 24)))
             self.min_cancel_input.setText(str(info.get('min_cancel_time', 24)))
             self.class_days_input.setText(info.get('class_days', 'T,Th'))
@@ -261,6 +373,7 @@ class CourseInfoPanel(QWidget):
             self.course_title_value  = info.get('course_title', '')
             self.instructors_value   = info.get('instructors', '')
             self.course_folder_value = info.get('course_folder', '')
+            self.moodle_url_value    = info.get('moodle_url', '')
             self.min_signup_value    = info.get('min_signup_time', 24)
             self.min_cancel_value    = info.get('min_cancel_time', 24)
             self.load_modules_into_table()
@@ -283,6 +396,7 @@ class CourseInfoPanel(QWidget):
                 'course_title':    self.course_title_input.text().strip(),
                 'instructors':     self.instructors_input.text().strip(),
                 'course_folder':   self.course_folder_input.text().strip(),
+                'moodle_url':      self.moodle_url_input.text().strip(),
                 'min_signup_time': int(min_signup_text) if min_signup_text.isdigit() else 24,
                 'min_cancel_time': int(min_cancel_text) if min_cancel_text.isdigit() else 24,
                 'class_days':       self.class_days_input.text().strip(),
@@ -311,6 +425,7 @@ class CourseInfoPanel(QWidget):
             self.course_title_value  = data['course_title']
             self.instructors_value   = data['instructors']
             self.course_folder_value = data['course_folder']
+            self.moodle_url_value    = data['moodle_url']
             self.min_signup_value    = data['min_signup_time']
             self.min_cancel_value    = data['min_cancel_time']
 
@@ -338,6 +453,7 @@ class CourseInfoPanel(QWidget):
             'course_title':    self.course_title_value,
             'instructors':     self.instructors_value,
             'course_folder':   self.course_folder_value,
+            'moodle_url':      self.moodle_url_value,
             'min_signup_time': self.min_signup_value,
             'min_cancel_time': self.min_cancel_value,
         }
@@ -438,6 +554,9 @@ class CourseInfoPanel(QWidget):
                 QMessageBox.warning(self, "Duplicate", f"Section {num} already exists.")
                 return
         self._append_section_row({'section_number': num})
+
+    def _manage_enrolled_students(self):
+        EnrolledStudentsDialog(self.engine, self).exec()
 
     def _import_section_roster(self):
         from PyQt6.QtWidgets import QInputDialog

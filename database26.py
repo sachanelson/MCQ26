@@ -76,6 +76,7 @@ class CourseInfo(Base):
     course_title    = Column(String,  nullable=True,  default='Principles of Neuroscience')
     instructors     = Column(String,  nullable=True,  default='Sacha Nelson')  # comma-separated
     course_folder            = Column(String,  nullable=False, default='')       # base filesystem path
+    moodle_url               = Column(String,  nullable=True,  default='')
     min_signup_time          = Column(Integer, nullable=True,  default=24)       # hours
     min_cancel_time          = Column(Integer, nullable=True,  default=24)       # hours
     first_segment_count      = Column(Integer, nullable=True,  default=4)        # number of required first-segment modules
@@ -174,12 +175,13 @@ class Student(Base):
     academic_level   = Column(String,  nullable=True)  # e.g. UG, GRAD, TA
     program_of_study = Column(String,  nullable=True)
     section_number   = Column(Integer, nullable=True)  # FK to course_sections.section_number
+    enrolled         = Column(Boolean, nullable=False, default=True)
     created_at       = Column(DateTime, default=datetime.now)
 
     # Relationships (mirrors old schema; signup table added later)
     module_progress = relationship("StudentModuleProgress", back_populates="student", cascade="all, delete-orphan")
     quizzes         = relationship("Quiz", back_populates="student", cascade="all, delete-orphan")
-    # signups         = relationship("Signup", back_populates="student", cascade="all, delete-orphan")
+    session_signups = relationship("SessionSignup", back_populates="student", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<Student(name='{self.name}', code='{self.student_code}', section={self.section_number})>"
@@ -338,6 +340,38 @@ class QuizSession(Base):
                 f"date='{self.date}', time='{self.start_time}-{self.end_time}')>")
 
 
+class SessionSignup(Base):
+    __tablename__ = 'session_signups'
+
+    signup_id = Column(Integer, primary_key=True)
+    session_id = Column(Integer, ForeignKey('quiz_sessions.session_id', ondelete='CASCADE'), nullable=False)
+    student_id = Column(Integer, ForeignKey('students.student_id', ondelete='CASCADE'), nullable=False)
+    module_number = Column(Integer, nullable=False)
+    quiz_id = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.now)
+
+    student = relationship("Student", back_populates="session_signups")
+    session = relationship("QuizSession")
+
+    __table_args__ = (
+        UniqueConstraint('session_id', 'student_id', 'quiz_id', name='uq_session_signup_quiz'),
+    )
+
+
+class OutgoingEmail(Base):
+    __tablename__ = 'outgoing_emails'
+
+    email_id = Column(Integer, primary_key=True)
+    recipient = Column(String, nullable=False)
+    subject = Column(String, nullable=False)
+    body = Column(Text, nullable=False)
+    email_type = Column(String, nullable=False)
+    status = Column(String, nullable=False, default='queued')
+    created_at = Column(DateTime, default=datetime.now)
+    sent_at = Column(DateTime, nullable=True)
+    error = Column(Text, nullable=True)
+
+
 class QuizSessionDefault(Base):
     """Default template for recurring class/section quiz sessions.
 
@@ -417,6 +451,9 @@ def _migrate_add_columns(engine: Engine) -> None:
         # --- course_info ---
         ci_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(course_info)"))}
         _add_col = lambda col, defn: conn.execute(text(f"ALTER TABLE course_info ADD COLUMN {col} {defn}"))
+        if 'moodle_url' not in ci_cols:
+            _add_col('moodle_url', "VARCHAR DEFAULT ''")
+            logger.info("Migration: added 'moodle_url' to course_info.")
         if 'year' not in ci_cols:
             _add_col('year', 'INTEGER DEFAULT 2026')
             logger.info("Migration: added 'year' to course_info.")
@@ -463,6 +500,9 @@ def _migrate_add_columns(engine: Engine) -> None:
         if 'section_number' not in st_cols:
             conn.execute(text('ALTER TABLE students ADD COLUMN section_number INTEGER'))
             logger.info("Migration: added 'section_number' to students.")
+        if 'enrolled' not in st_cols:
+            conn.execute(text('ALTER TABLE students ADD COLUMN enrolled BOOLEAN NOT NULL DEFAULT 1'))
+            logger.info("Migration: added 'enrolled' to students.")
         conn.commit()
     # Backfill NULLs on the existing CourseInfo row
     with Session(engine) as session:
@@ -564,6 +604,7 @@ def _seed_initial_data(engine: Engine) -> None:
                 course_title='Principles of Neuroscience',
                 instructors='Sacha Nelson',
                 course_folder='',
+                moodle_url='',
                 min_signup_time=24,
                 min_cancel_time=24,
                 first_segment_count=4,
@@ -609,6 +650,7 @@ def get_course_info(engine: Engine) -> Dict:
             'course_title':    row.course_title    or '',
             'instructors':     row.instructors     or '',
             'course_folder':   row.course_folder   or '',
+            'moodle_url':      row.moodle_url      or '',
             'min_signup_time': row.min_signup_time or 24,
             'min_cancel_time': row.min_cancel_time or 24,
             'first_segment_count': row.first_segment_count or 4,
@@ -621,6 +663,10 @@ def get_course_info(engine: Engine) -> Dict:
             'class_classroom':  row.class_classroom  or '',
             'num_sections':     row.num_sections     if row.num_sections is not None else 0,
         }
+
+
+def get_course_moodle_url(engine: Engine) -> str:
+    return get_course_info(engine).get('moodle_url', '')
 
 
 def save_course_info(engine: Engine, data: Dict) -> None:
@@ -636,6 +682,7 @@ def save_course_info(engine: Engine, data: Dict) -> None:
         row.course_title    = data.get('course_title',    row.course_title    or '')
         row.instructors     = data.get('instructors',     row.instructors     or '')
         row.course_folder   = data.get('course_folder',   row.course_folder   or '')
+        row.moodle_url      = data.get('moodle_url',      row.moodle_url      or '')
         row.min_signup_time         = data.get('min_signup_time',         row.min_signup_time         or 24)
         row.min_cancel_time         = data.get('min_cancel_time',         row.min_cancel_time         or 24)
         row.first_segment_count     = data.get('first_segment_count',     row.first_segment_count     or 4)
@@ -674,17 +721,67 @@ def format_student_display(name: str, student_code: str) -> str:
     return f"{name} ({student_code})"
 
 
-def get_all_students(engine: Engine) -> List[Student]:
-    """Return all Student rows ordered by name."""
+def get_all_students(engine: Engine, enrolled_only: bool = True) -> List[Student]:
+    """Return Student rows ordered by name."""
     with Session(engine) as session:
-        return session.query(Student).order_by(Student.name).all()
+        query = session.query(Student)
+        if enrolled_only:
+            query = query.filter(Student.enrolled.is_(True))
+        return query.order_by(Student.name).all()
 
 
-def get_all_students_as_dicts(engine: Engine) -> List[Dict]:
-    """Return all students as plain dictionaries (safe for serialization)."""
+def get_all_students_as_dicts(engine: Engine, enrolled_only: bool = True) -> List[Dict]:
+    """Return students as plain dictionaries (safe for serialization)."""
     with Session(engine) as session:
-        rows = session.query(Student).order_by(Student.name).all()
+        query = session.query(Student)
+        if enrolled_only:
+            query = query.filter(Student.enrolled.is_(True))
+        rows = query.order_by(Student.name).all()
         return [_student_to_dict(r) for r in rows]
+
+
+def save_enrolled_students(engine: Engine, students: List[Dict], removed_student_ids: List[int]) -> None:
+    """Save roster edits and mark removed students as no longer enrolled."""
+    with Session(engine) as session:
+        rows_by_id = {
+            row.student_id: row
+            for row in session.query(Student).filter(Student.enrolled.is_(True)).all()
+        }
+        seen_codes = set()
+        for data in students:
+            student_id = data.get('student_id')
+            row = rows_by_id.get(student_id)
+            if row is None:
+                raise ValueError(f"Enrolled student ID {student_id!r} was not found.")
+            name = str(data.get('name') or '').strip()
+            code = str(data.get('student_code') or '').strip()
+            section_number = data.get('section_number')
+            if not name:
+                raise ValueError('Each enrolled student must have a name.')
+            if not code:
+                raise ValueError(f"Student '{name}' must have a code.")
+            folded_code = code.casefold()
+            if folded_code in seen_codes:
+                raise ValueError(f"Student code '{code}' is duplicated.")
+            seen_codes.add(folded_code)
+            conflict = session.query(Student).filter(
+                Student.student_code.ilike(code), Student.student_id != student_id
+            ).first()
+            if conflict is not None:
+                raise ValueError(f"Student code '{code}' is already assigned to another student.")
+            if section_number is not None:
+                section = session.query(CourseSection).filter_by(section_number=section_number).first()
+                if section is None:
+                    raise ValueError(f"Section {section_number} does not exist.")
+            row.name = name
+            row.student_code = code
+            row.section_number = section_number
+            row.enrolled = True
+        for student_id in removed_student_ids:
+            row = rows_by_id.get(student_id)
+            if row is not None:
+                row.enrolled = False
+        session.commit()
 
 
 def get_student_by_id(engine: Engine, student_id: int) -> Optional[Student]:
@@ -722,6 +819,7 @@ def _student_to_dict(student: Student) -> Dict:
         'academic_level':   student.academic_level or '',
         'program_of_study': student.program_of_study or '',
         'section_number':   student.section_number,
+        'enrolled':         student.enrolled,
     }
 
 
@@ -781,7 +879,7 @@ def get_students_in_section(engine: Engine, section_number: int) -> List[Student
     with Session(engine) as session:
         return (
             session.query(Student)
-            .filter_by(section_number=section_number)
+            .filter_by(section_number=section_number, enrolled=True)
             .order_by(Student.name)
             .all()
         )
@@ -925,7 +1023,7 @@ def get_students_for_section(engine: Engine, section_number: int) -> List[Studen
     with Session(engine) as session:
         return (
             session.query(Student)
-            .filter_by(section_number=section_number)
+            .filter_by(section_number=section_number, enrolled=True)
             .order_by(Student.name)
             .all()
         )
@@ -1463,6 +1561,162 @@ def delete_quiz_session(engine: Engine, session_id: int) -> None:
         if row:
             session.delete(row)
             session.commit()
+
+
+def get_active_session_signups(engine: Engine, session_id: int) -> List[Dict]:
+    with Session(engine) as session:
+        rows = (
+            session.query(SessionSignup, Student)
+            .join(Student, Student.student_id == SessionSignup.student_id)
+            .filter(SessionSignup.session_id == session_id)
+            .order_by(Student.name)
+            .all()
+        )
+        return [{
+            'signup_id': signup.signup_id,
+            'student_id': student.student_id,
+            'student_code': student.student_code,
+            'student_name': student.name,
+            'module_number': signup.module_number,
+            'quiz_id': signup.quiz_id,
+        } for signup, student in rows]
+
+
+def get_upcoming_quiz_sessions(engine: Engine, from_date: str | None = None) -> List[Dict]:
+    """Return active QuizSession rows on or after *from_date* (defaults to today)."""
+    if from_date is None:
+        from_date = datetime.now().strftime('%Y-%m-%d')
+    with Session(engine) as session:
+        rows = (
+            session.query(QuizSession)
+            .filter(QuizSession.active.is_(True))
+            .filter(QuizSession.date >= from_date)
+            .order_by(QuizSession.date, QuizSession.start_time)
+            .all()
+        )
+        return [_session_to_dict(r) for r in rows]
+
+
+def get_session_signup_count(engine: Engine, session_id: int) -> int:
+    """Return the number of active signups for a quiz session."""
+    with Session(engine) as session:
+        return session.query(SessionSignup).filter_by(session_id=session_id).count()
+
+
+def find_student_by_email_or_name(engine: Engine, email: str, name: str) -> Optional[Dict]:
+    """Find a student by e-mail or, failing that, by normalized full name.
+
+    Returns a dict with student_id, student_code, and name, or None.
+    """
+    email_norm = (email or '').strip().lower()
+    name_norm = ' '.join((name or '').lower().split())
+    with Session(engine) as session:
+        if email_norm:
+            row = session.query(Student).filter(
+                func.lower(Student.email) == email_norm,
+                Student.enrolled.is_(True),
+            ).first()
+            if row:
+                return {
+                    'student_id': row.student_id,
+                    'student_code': row.student_code,
+                    'name': row.name,
+                    'email': row.email or '',
+                }
+        if name_norm:
+            row = session.query(Student).filter(
+                func.lower(Student.name) == name_norm,
+                Student.enrolled.is_(True),
+            ).first()
+            if row:
+                return {
+                    'student_id': row.student_id,
+                    'student_code': row.student_code,
+                    'name': row.name,
+                    'email': row.email or '',
+                }
+        return None
+
+
+def create_session_signups(
+    engine: Engine,
+    session_id: int,
+    student_ids: List[int],
+    module_number: int,
+    quiz_ids: Dict[int, str],
+) -> int:
+    with Session(engine) as session:
+        created = 0
+        for student_id in student_ids:
+            quiz_id = quiz_ids.get(student_id)
+            if not quiz_id:
+                continue
+            exists = session.query(SessionSignup).filter_by(
+                session_id=session_id, student_id=student_id, quiz_id=quiz_id,
+            ).first()
+            if exists is None:
+                session.add(SessionSignup(
+                    session_id=session_id,
+                    student_id=student_id,
+                    module_number=module_number,
+                    quiz_id=quiz_id,
+                ))
+                created += 1
+        session.commit()
+        return created
+
+
+def queue_outgoing_email(
+    engine: Engine,
+    recipient: str,
+    subject: str,
+    body: str,
+    email_type: str,
+) -> int:
+    with Session(engine) as session:
+        row = OutgoingEmail(
+            recipient=recipient,
+            subject=subject,
+            body=body,
+            email_type=email_type,
+        )
+        session.add(row)
+        session.commit()
+        return row.email_id
+
+
+def get_outgoing_emails(engine: Engine, status: Optional[str] = None) -> List[Dict]:
+    with Session(engine) as session:
+        query = session.query(OutgoingEmail).order_by(OutgoingEmail.created_at.desc())
+        if status is not None:
+            query = query.filter_by(status=status)
+        return [{
+            'email_id': row.email_id,
+            'recipient': row.recipient,
+            'subject': row.subject,
+            'body': row.body,
+            'email_type': row.email_type,
+            'status': row.status,
+            'created_at': row.created_at.isoformat() if row.created_at else '',
+            'sent_at': row.sent_at.isoformat() if row.sent_at else '',
+            'error': row.error or '',
+        } for row in query.all()]
+
+
+def update_outgoing_email_status(
+    engine: Engine,
+    email_id: int,
+    status: str,
+    error: Optional[str] = None,
+) -> None:
+    with Session(engine) as session:
+        row = session.query(OutgoingEmail).filter_by(email_id=email_id).first()
+        if row is None:
+            return
+        row.status = status
+        row.error = error
+        row.sent_at = datetime.now() if status == 'sent' else None
+        session.commit()
 
 
 def _session_to_dict(row: 'QuizSession') -> Dict:

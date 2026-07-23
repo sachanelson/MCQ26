@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
     QLabel, QLineEdit, QPushButton, QComboBox, QDateEdit, QTimeEdit,
     QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
-    QDialog, QDialogButtonBox, QSpinBox, QTextEdit, QSizePolicy,
+    QDialog, QDialogButtonBox, QSpinBox, QTextEdit, QSizePolicy, QListWidget,
 )
 from PyQt6.QtCore import Qt, QDate, QTime
 
@@ -33,6 +33,10 @@ from database26 import (
     get_quiz_session, save_quiz_session, delete_quiz_session,
     get_session_default, save_session_default,
 )
+from qsession_signup26 import (
+    assign_students_to_qsession, enrolled_students, get_active_session_signups,
+)
+from moodle_choice_sync26 import MoodleChoiceSync, MoodleSyncError
 
 # Internal label -> DB constant
 _TYPE_LABELS  = ['lecture', 'section', 'extra']
@@ -383,6 +387,69 @@ class QSessionPanel(QWidget):
         sessions_group.setLayout(sessions_layout)
         outer.addWidget(sessions_group)
 
+        assignment_group = QGroupBox('Assign Students to Selected Session')
+        assignment_layout = QVBoxLayout(assignment_group)
+        assignment_controls = QHBoxLayout()
+        assignment_controls.addWidget(QLabel('Module:'))
+        self.assignment_module_spin = QSpinBox()
+        self.assignment_module_spin.setRange(0, 99)
+        assignment_controls.addWidget(self.assignment_module_spin)
+        assignment_controls.addWidget(QLabel('Sync window (days):'))
+        self.sync_days_ahead_spin = QSpinBox()
+        self.sync_days_ahead_spin.setRange(0, 365)
+        self.sync_days_ahead_spin.setValue(7)
+        self.sync_days_ahead_spin.setToolTip(
+            '0 = all future sessions; otherwise only sessions within this many days are published.')
+        assignment_controls.addWidget(self.sync_days_ahead_spin)
+        assignment_controls.addWidget(QLabel('Student:'))
+        self.assignment_student_combo = QComboBox()
+        assignment_controls.addWidget(self.assignment_student_combo)
+        add_student_button = QPushButton('Add Student')
+        add_student_button.clicked.connect(self._add_assignment_student)
+        assignment_controls.addWidget(add_student_button)
+        add_all_button = QPushButton('Add All Enrolled')
+        add_all_button.clicked.connect(self._add_all_assignment_students)
+        assignment_controls.addWidget(add_all_button)
+        assignment_controls.addWidget(QLabel('Section:'))
+        self.assignment_section_combo = QComboBox()
+        assignment_controls.addWidget(self.assignment_section_combo)
+        add_section_button = QPushButton('Add Section')
+        add_section_button.clicked.connect(self._add_section_assignment_students)
+        assignment_controls.addWidget(add_section_button)
+        assignment_controls.addStretch()
+        assignment_layout.addLayout(assignment_controls)
+
+        assignment_lists = QHBoxLayout()
+        self.assignment_students_list = QListWidget()
+        assignment_lists.addWidget(self.assignment_students_list)
+        self.session_signups_table = QTableWidget(0, 4)
+        self.session_signups_table.setHorizontalHeaderLabels(['Student', 'Code', 'Module', 'Quiz ID'])
+        self.session_signups_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.session_signups_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        assignment_lists.addWidget(self.session_signups_table)
+        assignment_layout.addLayout(assignment_lists)
+
+        assignment_actions = QHBoxLayout()
+        assign_button = QPushButton('Assign Selected Students')
+        assign_button.clicked.connect(self._assign_students_to_session)
+        assignment_actions.addWidget(assign_button)
+        clear_button = QPushButton('Clear Selected Students')
+        clear_button.clicked.connect(self._clear_assignment_students)
+        assignment_actions.addWidget(clear_button)
+        sync_button = QPushButton('Sync with Moodle')
+        sync_button.setToolTip('Publish sessions to the Moodle Choice activity and import student choices')
+        sync_button.clicked.connect(self._sync_with_moodle)
+        assignment_actions.addWidget(sync_button)
+        assignment_actions.addStretch()
+        assignment_layout.addLayout(assignment_actions)
+
+        self.sync_status_label = QLabel('Moodle sync: not run yet')
+        self.sync_status_label.setWordWrap(True)
+        assignment_layout.addWidget(self.sync_status_label)
+
+        outer.addWidget(assignment_group)
+        self._refresh_assignment_students()
+
         # Populate rooms and section combos
         self._populate_room_combo()
         self._populate_section_combo()
@@ -548,6 +615,166 @@ class QSessionPanel(QWidget):
         self._set_room(s['room'])
         self.capacity_spin.setValue(s['capacity'])
         self.proctor_edit.setText(s['proctor'])
+        self._refresh_session_signups()
+
+    def _refresh_assignment_students(self):
+        selected_id = self.assignment_student_combo.currentData()
+        self.assignment_student_combo.blockSignals(True)
+        self.assignment_student_combo.clear()
+        self.assignment_student_combo.addItem('Select a student', None)
+        for student in enrolled_students(self.engine):
+            self.assignment_student_combo.addItem(
+                f'{student.name} ({student.student_code})', student.student_id,
+            )
+        index = self.assignment_student_combo.findData(selected_id)
+        if index >= 0:
+            self.assignment_student_combo.setCurrentIndex(index)
+        self.assignment_student_combo.blockSignals(False)
+        self.assignment_section_combo.clear()
+        self.assignment_section_combo.addItem('Select a section', None)
+        for section in get_all_sections(self.engine):
+            self.assignment_section_combo.addItem(
+                f"Section {section['section_number']}", section['section_number'],
+            )
+
+    def _assignment_student_ids(self):
+        return [
+            self.assignment_students_list.item(row).data(Qt.ItemDataRole.UserRole)
+            for row in range(self.assignment_students_list.count())
+        ]
+
+    def _add_assignment_students(self, students):
+        existing_ids = set(self._assignment_student_ids())
+        for student in students:
+            if student.student_id not in existing_ids:
+                item = QTableWidgetItem()
+                item.setText(f'{student.name} ({student.student_code})')
+                item.setData(Qt.ItemDataRole.UserRole, student.student_id)
+                self.assignment_students_list.addItem(item.text())
+                self.assignment_students_list.item(self.assignment_students_list.count() - 1).setData(
+                    Qt.ItemDataRole.UserRole, student.student_id,
+                )
+                existing_ids.add(student.student_id)
+
+    def _add_assignment_student(self):
+        student_id = self.assignment_student_combo.currentData()
+        if student_id is None:
+            return
+        student = next(
+            (student for student in enrolled_students(self.engine) if student.student_id == student_id),
+            None,
+        )
+        if student is not None:
+            self._add_assignment_students([student])
+
+    def _add_all_assignment_students(self):
+        self._add_assignment_students(enrolled_students(self.engine))
+
+    def _add_section_assignment_students(self):
+        section_number = self.assignment_section_combo.currentData()
+        if section_number is None:
+            return
+        self._add_assignment_students(enrolled_students(self.engine, section_number))
+
+    def _clear_assignment_students(self):
+        self.assignment_students_list.clear()
+
+    def _refresh_session_signups(self):
+        self.session_signups_table.setRowCount(0)
+        if self._selected_session_id is None:
+            return
+        for signup in get_active_session_signups(self.engine, self._selected_session_id):
+            row = self.session_signups_table.rowCount()
+            self.session_signups_table.insertRow(row)
+            for column, value in enumerate((
+                signup['student_name'],
+                signup['student_code'],
+                str(signup['module_number']),
+                signup['quiz_id'],
+            )):
+                self.session_signups_table.setItem(row, column, QTableWidgetItem(value))
+
+    def _assign_students_to_session(self):
+        if self._selected_session_id is None:
+            QMessageBox.warning(self, 'No Session Selected', 'Select a session from Scheduled Sessions first.')
+            return
+        try:
+            course_folder = get_course_info(self.engine).get('course_folder', '')
+            result = assign_students_to_qsession(
+                self.engine,
+                self._selected_session_id,
+                self._assignment_student_ids(),
+                self.assignment_module_spin.value(),
+                course_folder,
+            )
+        except Exception as error:
+            QMessageBox.warning(self, 'Could Not Assign Students', str(error))
+            return
+        self._refresh_session_signups()
+        self._clear_assignment_students()
+        missing_count = len(result['missing_student_ids'])
+        message = f"Assigned {result['created']} student(s).\nQsession folder: {result['directory']}"
+        if missing_count:
+            message += f'\n{missing_count} student(s) had no available quiz PDF for that module.'
+        QMessageBox.information(self, 'Students Assigned', message)
+
+    def _sync_with_moodle(self):
+        info = get_course_info(self.engine)
+        course_url = info.get('moodle_url', '').strip()
+        if not course_url:
+            QMessageBox.warning(
+                self, 'Moodle URL Missing',
+                'Set the Course Moodle URL in Course Info before syncing.')
+            return
+        course_folder = info.get('course_folder', '').strip()
+        if not course_folder:
+            QMessageBox.warning(
+                self, 'Course Folder Missing',
+                'Set the Course Folder in Course Info before syncing.')
+            return
+
+        QMessageBox.information(
+            self, 'Moodle Sync Started',
+            'A Chrome window will open for Moodle. If prompted, log in and/or '
+            'complete Duo/SSO. After login, the sync will run automatically.')
+
+        try:
+            days_ahead = self.sync_days_ahead_spin.value()
+            with MoodleChoiceSync(course_url=course_url, headless=False) as sync:
+                result = sync.sync(
+                    engine=self.engine,
+                    module_number=self.assignment_module_spin.value(),
+                    course_folder=course_folder,
+                    days_ahead=days_ahead if days_ahead > 0 else None,
+                )
+        except MoodleSyncError as error:
+            QMessageBox.warning(self, 'Moodle Sync Failed', str(error))
+            self.sync_status_label.setText(f'Moodle sync failed: {error}')
+            return
+        except Exception as error:
+            QMessageBox.warning(
+                self, 'Moodle Sync Error',
+                f'An unexpected error occurred during sync:\n{error}')
+            self.sync_status_label.setText(f'Moodle sync error: {error}')
+            return
+
+        self._refresh_session_signups()
+        self._refresh_assignment_students()
+        status = (
+            f"Moodle sync: published {result.published_options} option(s), "
+            f"imported {result.imported_signups} signup(s)."
+        )
+        if result.unmatched_users:
+            status += f" Unmatched users: {len(result.unmatched_users)}."
+        if result.errors:
+            status += f" Errors: {len(result.errors)}."
+        self.sync_status_label.setText(status)
+        QMessageBox.information(
+            self, 'Moodle Sync Complete',
+            f"Published {result.published_options} session option(s).\n"
+            f"Imported {result.imported_signups} signup(s).\n"
+            f"Unmatched users: {len(result.unmatched_users)}\n"
+            f"Errors: {len(result.errors)}")
 
     def _set_type_combo(self, db_type: str):
         label = {v: k for k, v in _TYPE_DB.items()}.get(db_type, 'extra')

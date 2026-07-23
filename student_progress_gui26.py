@@ -26,14 +26,13 @@ from database26 import (
     get_all_student_progress, get_all_quizzes,
     update_progress_completed, increment_attempts_count,
     record_quiz_attempt, delete_quiz_attempt,
-    get_section_meeting_grades, get_section_meetings, get_students_for_section,
-    save_section_meeting_grade,
 )
 from shared_gui26 import BaseMCQApp
 from regrade_dialog26 import RegradeDialog
 from course_info_panel26 import CourseInfoPanel
 from qsession_panel26 import QSessionPanel
-from section_workspace26 import export_meeting_grades
+from grader_panel26 import GraderPanel
+from email_management26 import EmailManagementPanel
 
 
 def _format_student(student: Student) -> str:
@@ -63,16 +62,21 @@ class StudentProgressGUI(BaseMCQApp):
         self.progress_tab = self._create_progress_tab()
         self.tabs.addTab(self.progress_tab, "Student Progress")
 
-        # Quiz Session tab
+        # Qsessions tab
         self.qsession_panel = QSessionPanel(self.engine, self)
-        self.tabs.addTab(self.qsession_panel, "Quiz Session")
+        self.tabs.addTab(self.qsession_panel, "Qsessions")
+
+        # Grader tab
+        self.grader_panel = GraderPanel(self.engine, self)
+        self.tabs.addTab(self.grader_panel, "Grader")
+
+        # Email Management tab
+        self.email_management_panel = EmailManagementPanel(self.engine, self)
+        self.tabs.addTab(self.email_management_panel, "Email Management")
 
         # Quiz Attempts tab
         self.quizzes_tab = self._create_quizzes_tab()
         self.tabs.addTab(self.quizzes_tab, "Quiz Attempts")
-
-        self.section_grades_tab = self._create_section_grades_tab()
-        self.tabs.addTab(self.section_grades_tab, "Section Meeting Grades")
 
     # -----------------------------------------------------------------------
     # Student Progress tab
@@ -261,129 +265,6 @@ class StudentProgressGUI(BaseMCQApp):
             if s.student_id == student_id:
                 return s
         return None
-
-    # -----------------------------------------------------------------------
-    # Section Meeting Grades tab
-    # -----------------------------------------------------------------------
-    def _create_section_grades_tab(self):
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-
-        controls = QHBoxLayout()
-        controls.addWidget(QLabel("Meeting:"))
-        self.section_meeting_combo = QComboBox()
-        self.section_meeting_combo.currentIndexChanged.connect(self._load_section_meeting_grades)
-        controls.addWidget(self.section_meeting_combo)
-        refresh_btn = QPushButton("Refresh")
-        refresh_btn.clicked.connect(self._refresh_section_meeting_grades)
-        controls.addWidget(refresh_btn)
-        save_btn = QPushButton("Save Grade Changes")
-        save_btn.clicked.connect(self._save_section_meeting_grades)
-        controls.addWidget(save_btn)
-        export_btn = QPushButton("Export Selected Grades")
-        export_btn.clicked.connect(self._export_section_meeting_grades)
-        controls.addWidget(export_btn)
-        controls.addStretch()
-        layout.addLayout(controls)
-
-        layout.addWidget(QLabel("Scores must be blank, 0, 1, or 2."))
-        self.section_grades_table = QTableWidget(0, 6)
-        self.section_grades_table.setHorizontalHeaderLabels([
-            "Student Code", "Student", "Worksheet ID", "Score", "Attendance", "Note",
-        ])
-        self.section_grades_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        layout.addWidget(self.section_grades_table)
-        self._refresh_section_meeting_grades()
-        return tab
-
-    def _refresh_section_meeting_grades(self):
-        current_id = self.section_meeting_combo.currentData()
-        self.section_meeting_combo.blockSignals(True)
-        self.section_meeting_combo.clear()
-        for meeting in get_section_meetings(self.engine):
-            label = (
-                f"Section {meeting['section_number']} — {meeting['meeting_date']} "
-                f"{meeting['start_time']}"
-            )
-            self.section_meeting_combo.addItem(label, meeting['meeting_id'])
-        index = self.section_meeting_combo.findData(current_id)
-        if index >= 0:
-            self.section_meeting_combo.setCurrentIndex(index)
-        self.section_meeting_combo.blockSignals(False)
-        self._load_section_meeting_grades()
-
-    def _selected_section_meeting(self):
-        meeting_id = self.section_meeting_combo.currentData()
-        return next(
-            (meeting for meeting in get_section_meetings(self.engine)
-             if meeting['meeting_id'] == meeting_id),
-            None,
-        )
-
-    def _load_section_meeting_grades(self):
-        meeting = self._selected_section_meeting()
-        self.section_grades_table.setRowCount(0)
-        if meeting is None:
-            return
-        grades = {
-            grade['student_id']: grade
-            for grade in get_section_meeting_grades(self.engine, meeting['meeting_id'])
-        }
-        students = get_students_for_section(self.engine, meeting['section_number'])
-        self.section_grades_table.setRowCount(len(students))
-        for row, student in enumerate(students):
-            grade = grades.get(student.student_id, {})
-            values = [
-                student.student_code,
-                student.name,
-                grade.get('worksheet_id', ''),
-                '' if grade.get('score') is None else str(grade['score']),
-                grade.get('attendance_status', ''),
-                grade.get('note', ''),
-            ]
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if column == 0:
-                    item.setData(Qt.ItemDataRole.UserRole, student.student_id)
-                if column in (0, 1, 2):
-                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                self.section_grades_table.setItem(row, column, item)
-        self.section_grades_table.resizeColumnsToContents()
-
-    def _save_section_meeting_grades(self):
-        meeting = self._selected_section_meeting()
-        if meeting is None:
-            return
-        try:
-            for row in range(self.section_grades_table.rowCount()):
-                student_id = self.section_grades_table.item(row, 0).data(Qt.ItemDataRole.UserRole)
-                score_text = self.section_grades_table.item(row, 3).text().strip()
-                if score_text not in ('', '0', '1', '2'):
-                    raise ValueError('Scores must be blank, 0, 1, or 2.')
-                save_section_meeting_grade(self.engine, {
-                    'section_meeting_id': meeting['meeting_id'],
-                    'student_id': student_id,
-                    'worksheet_id': self.section_grades_table.item(row, 2).text().strip(),
-                    'score': int(score_text) if score_text else None,
-                    'attendance_status': self.section_grades_table.item(row, 4).text().strip(),
-                    'note': self.section_grades_table.item(row, 5).text().strip(),
-                })
-            self._export_section_meeting_grades(show_message=False)
-            self._load_section_meeting_grades()
-        except Exception as error:
-            QMessageBox.warning(self, 'Could Not Save Grades', str(error))
-
-    def _export_section_meeting_grades(self, show_message=True):
-        meeting = self._selected_section_meeting()
-        course_folder = get_course_info(self.engine).get('course_folder', '').strip()
-        if meeting is None or not course_folder:
-            return
-        try:
-            path = export_meeting_grades(self.engine, course_folder, meeting)
-            if show_message:
-                QMessageBox.information(self, 'Grades Exported', path)
-        except Exception as error:
-            QMessageBox.warning(self, 'Could Not Export Grades', str(error))
 
     # -----------------------------------------------------------------------
     # Quiz Attempts tab

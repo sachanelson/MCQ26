@@ -107,6 +107,7 @@ def import_section_roster(file_path: str, engine, section_number: int) -> int:
                 student.name = name
                 student.email = email
                 student.section_number = section_number
+                student.enrolled = True
                 code_invalid = not (student.student_code and student.student_code.isalnum())
                 if name_changed or code_invalid:
                     old_code = (student.student_code or '').casefold()

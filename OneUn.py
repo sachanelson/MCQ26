@@ -594,8 +594,6 @@ class ProblemDefinitionParser:
 
         variables = VariableTableParser.parse(var_lines)
         constants = ConstantsTableParser.parse(const_lines)
-        if not variables:
-            raise ValueError('OneUn definitions must contain at least one [VARIABLES] row.')
 
         return ProblemDefinition(
             equations=[],
@@ -939,7 +937,7 @@ class TemplateProcessor:
             if metadata:
                 self._ensure_header_styles(root, styles_tree)
                 self._inject_header(root, ns, metadata, student_code, student_name)
-                self._ensure_footer(styles_tree)
+                self._ensure_footer(styles_tree, metadata=metadata)
                 if styles_tree is not None:
                     styles_tree.write(styles_xml, xml_declaration=True,
                                       encoding='UTF-8', pretty_print=False)
@@ -1182,7 +1180,7 @@ class TemplateProcessor:
                       '          Date: _______________________________')
         text_el.insert(2, sig_p)
 
-    def _ensure_footer(self, styles_tree) -> None:
+    def _ensure_footer(self, styles_tree, metadata=None) -> None:
         """Add a centered page-number footer to the first master page."""
         if styles_tree is None:
             return
@@ -1222,11 +1220,21 @@ class TemplateProcessor:
         p = etree.SubElement(footer, f'{{{ns_text}}}p')
         p.set(f'{{{ns_text}}}style-name', 'OneUnFooter')
 
+        start_page = metadata.get('start_page') if metadata else None
+        total_pages = metadata.get('total_pages') if metadata else None
+
         pn = etree.SubElement(p, f'{{{ns_text}}}page-number')
         pn.set(f'{{{ns_s}}}num-format', '1')
+        if start_page is not None and start_page > 1:
+            pn.set(f'{{{ns_text}}}page-adjust', str(start_page - 1))
         pn.tail = ':'
-        pc = etree.SubElement(p, f'{{{ns_text}}}page-count')
-        pc.set(f'{{{ns_s}}}num-format', '1')
+
+        if total_pages is not None:
+            pc = etree.SubElement(p, f'{{{ns_text}}}span')
+            pc.text = str(total_pages)
+        else:
+            pc = etree.SubElement(p, f'{{{ns_text}}}page-count')
+            pc.set(f'{{{ns_s}}}num-format', '1')
 
     def _substitute_constants(self, root, definition: ProblemDefinition):
         """Replace #ConstName tokens in text nodes with their fixed values.
@@ -1454,7 +1462,7 @@ class OneUnODTGenerator:
         self.template_processor = TemplateProcessor()
         self.plot_generator = PlotGenerator()
 
-    def generate_quiz(self, definition: ProblemDefinition,
+    def generate_quiz(self, definition: Optional[ProblemDefinition],
                       template_path: str,
                       output_path: str = 'oneun_quiz.odt',
                       student_codes: Optional[List[str]] = None,
@@ -1518,6 +1526,10 @@ class OneUnODTGenerator:
         student_codes = student_codes or ['']
         output_ids = output_ids or {}
         answer_key_output_ids = answer_key_output_ids or {}
+
+        if definition is None:
+            definition = ProblemDefinition(
+                equations=[], variables={}, constants={}, pinned_vars=[])
 
         out_stem = os.path.splitext(output_path)[0]
         base_dir = os.path.dirname(os.path.abspath(output_path))
@@ -1790,6 +1802,29 @@ def create_quiz_odt(definition_path: str,
         mode=mode,
         base_seed=base_seed
     )
+
+
+def get_odt_template_page_count(template_path: str) -> Optional[int]:
+    """Return the saved page count from an .odt template's meta.xml, or None."""
+    import zipfile
+    from lxml import etree
+    try:
+        with zipfile.ZipFile(template_path, 'r') as z:
+            meta_bytes = z.read('meta.xml')
+    except (KeyError, zipfile.BadZipFile, FileNotFoundError):
+        return None
+    root = etree.fromstring(meta_bytes)
+    ns = {'meta': 'urn:oasis:names:tc:opendocument:xmlns:meta:1.0'}
+    stat = root.find('.//meta:document-statistic', namespaces=ns)
+    if stat is not None:
+        ns_meta = 'urn:oasis:names:tc:opendocument:xmlns:meta:1.0'
+        count = stat.get(f'{{{ns_meta}}}page-count')
+        if count is not None:
+            try:
+                return int(count)
+            except ValueError:
+                pass
+    return None
 
 
 # ---------------------------------------------------------------------------

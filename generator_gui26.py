@@ -5,7 +5,7 @@ import sys
 import os
 import shutil
 import glob
-from typing import List
+from typing import Dict, List
 from PyQt6.QtWidgets import (
     QFileDialog, QLabel, QWidget
 )
@@ -39,10 +39,14 @@ from database26 import (
 from shared_gui26 import BaseMCQApp
 from course_info_panel26 import CourseInfoPanel
 from llm_converter26 import LLMConverter
-from quiz_generator26 import create_quizzes_for_students, get_quiz_page_count
-from document_ids26 import format_quiz_id
+from quiz_generator26 import (
+    create_quizzes_for_students, get_quiz_page_count,
+    stamp_page_numbers_to_pdf, COURSE_FOLDER,
+)
+from document_ids26 import artifact_id, format_quiz_id
 from OneUn import (ProblemDefinitionParser, ProblemGenerator, OneUnODTGenerator,
-                  load_problem_definition, generate_problems_for_student)
+                  load_problem_definition, generate_problems_for_student,
+                  get_odt_template_page_count)
 
 
 
@@ -203,7 +207,7 @@ class MCQGeneratorGUI(BaseMCQApp):
         form_layout.addRow("Total Questions:", total_questions_layout)
 
         # Append One Unknown quiz option
-        self.append_oneun_checkbox = QCheckBox("Append One Unknown quiz")
+        self.append_oneun_checkbox = QCheckBox("Append Quant ODT")
         self.append_oneun_checkbox.setChecked(False)
         self.append_oneun_checkbox.setToolTip(
             "Also generate One Unknown ODTs appended to the MCQ quiz "
@@ -396,14 +400,22 @@ class MCQGeneratorGUI(BaseMCQApp):
 
             total_quizzes = sum(len(v) for v in created.values())
             created_codes = ', '.join(sorted(created.keys()))
+            quiz_folder = os.path.join(COURSE_FOLDER, f'module{module_number}', 'quizzes')
 
-            # Optionally append One Unknown quiz ODTs, reusing the One Unknown tab settings
+            # Optionally append Quant ODT, reusing the One Unknown tab settings
             if self.append_oneun_checkbox.isChecked():
                 self._append_oneun_to_quiz(
                     module_number=module_number,
                     student_codes=student_codes,
                     total_mcq_questions=total_bank_questions,
+                    created=created,
                 )
+            else:
+                for code, quiz_ids in created.items():
+                    for quiz_id in quiz_ids:
+                        quiz_pdf = os.path.join(quiz_folder, f'{artifact_id(quiz_id, "Q")}.pdf')
+                        if os.path.exists(quiz_pdf):
+                            stamp_page_numbers_to_pdf(quiz_pdf)
 
             QMessageBox.information(
                 self,
@@ -418,7 +430,8 @@ class MCQGeneratorGUI(BaseMCQApp):
             traceback.print_exc()
 
     def _append_oneun_to_quiz(self, module_number: int, student_codes: List[str],
-                              total_mcq_questions: int):
+                              total_mcq_questions: int,
+                              created: Dict[str, List[str]]):
         """Generate One Unknown ODTs appended to the MCQ PDFs.
 
         Validates that the One Unknown tab's settings are compatible with the
@@ -438,18 +451,19 @@ class MCQGeneratorGUI(BaseMCQApp):
                 "One Unknown document type must be 'Quiz' when appending to an MCQ quiz."
             )
 
-        # Module must match the MCQ module
-        oneun_module = self._extract_module_number(def_path)
-        if oneun_module is None:
-            raise ValueError(
-                f"Cannot determine module from One Unknown definition filename: {def_path!r}. "
-                "Use an M#_ prefix (e.g. M1_nernst.txt) to enable module matching."
-            )
-        if oneun_module != module_number:
-            raise ValueError(
-                f"Module mismatch: MCQ module is {module_number}, "
-                f"but One Unknown definition is for module {oneun_module}."
-            )
+        # Module must match the MCQ module (skip when no definition file is used)
+        if def_path:
+            oneun_module = self._extract_module_number(def_path)
+            if oneun_module is None:
+                raise ValueError(
+                    f"Cannot determine module from One Unknown definition filename: {def_path!r}. "
+                    "Use an M#_ prefix (e.g. M1_nernst.txt) to enable module matching."
+                )
+            if oneun_module != module_number:
+                raise ValueError(
+                    f"Module mismatch: MCQ module is {module_number}, "
+                    f"but One Unknown definition is for module {oneun_module}."
+                )
 
         # Determine MCQ page count from the first generated metadata JSON
         quiz_folder = os.path.join(
@@ -468,6 +482,12 @@ class MCQGeneratorGUI(BaseMCQApp):
             if fallback:
                 mcq_pages = get_quiz_page_count(fallback[0])
 
+        odt_pages = get_odt_template_page_count(template_path)
+        if odt_pages is None:
+            raise ValueError(f"Could not determine page count from ODT template {template_path!r}")
+        total_pages = mcq_pages + odt_pages
+        metadata['total_pages'] = total_pages
+
         # Output into the same module quizzes folder as the PDFs
         out_stem = os.path.join(quiz_folder, 'oneunknown_quiz.odt')
 
@@ -484,6 +504,13 @@ class MCQGeneratorGUI(BaseMCQApp):
             start_question=total_mcq_questions + 1,
             start_page=mcq_pages + 1,
         )
+
+        # Stamp combined page numbers onto the existing MCQ PDFs
+        for code, quiz_ids in created.items():
+            for quiz_id in quiz_ids:
+                quiz_pdf = os.path.join(quiz_folder, f'{artifact_id(quiz_id, "Q")}.pdf')
+                if os.path.exists(quiz_pdf):
+                    stamp_page_numbers_to_pdf(quiz_pdf, total_pages=total_pages)
 
         # Write a summary log alongside the generated ODTs
         odt_gen._write_summary_log(
@@ -1350,19 +1377,21 @@ class MCQGeneratorGUI(BaseMCQApp):
                       output_path, template_path, plot_config, def_path)
             or None if validation fails.  Errors are printed to terminal.
         """
-        # Validate definition file
+        # Definition file is optional (template can have no variables/constants)
         def_path = self.oneun_def_path.text().strip()
-        if not def_path or not os.path.exists(def_path):
-            print("[ERROR] Please select a valid problem definition file.")
+        if def_path and not os.path.exists(def_path):
+            print("[ERROR] Problem definition file not found.")
             return None
 
-        try:
-            definition = load_problem_definition(def_path)
-        except Exception as e:
-            print(f"[ERROR] Problem definition has errors: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
+        definition = None
+        if def_path:
+            try:
+                definition = load_problem_definition(def_path)
+            except Exception as e:
+                print(f"[ERROR] Problem definition has errors: {e}")
+                import traceback
+                traceback.print_exc()
+                return None
 
         # Validate template (required)
         template_path = self.oneun_tpl_path.text().strip()

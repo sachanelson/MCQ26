@@ -12,6 +12,7 @@ It relies on the local MCQ26 modules:
     - qr_code26.generate_qr_code
     - database26 for course info and Quiz records
 """
+import io
 import os
 import random
 import re
@@ -22,6 +23,7 @@ from typing import List, Dict, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from fpdf import FPDF
+from pypdf import PdfReader, PdfWriter
 
 from database26 import (
     Student, Quiz, get_course_info, get_student_by_code,
@@ -598,6 +600,43 @@ def get_quiz_page_count(metadata_json_path: str) -> int:
         metadata = json.load(f)
     page_nums = [int(k) for k in metadata if isinstance(k, str) and k.isdigit()]
     return max(page_nums) if page_nums else 0
+
+
+def pdf_page_count(pdf_path: str) -> int:
+    """Return the number of pages in a PDF file."""
+    return len(PdfReader(pdf_path).pages)
+
+
+def stamp_page_numbers_to_pdf(pdf_path: str, total_pages: Optional[int] = None) -> int:
+    """Stamp 'current:total' centered on every page of a PDF, in place.
+
+    If total_pages is not provided, the PDF's own page count is used.
+    """
+    reader = PdfReader(pdf_path)
+    n = len(reader.pages)
+    if total_pages is None:
+        total_pages = n
+    labels = [f'{i}:{total_pages}' for i in range(1, n + 1)]
+
+    overlay = FPDF(orientation='P', unit='mm', format='A4')
+    for label in labels:
+        overlay.add_page()
+        overlay.set_font('Helvetica', '', 10)
+        overlay.set_y(-15)
+        overlay.cell(0, 10, label, align='C')
+    overlay_bytes = bytes(overlay.output())
+    overlay_reader = PdfReader(io.BytesIO(overlay_bytes))
+
+    writer = PdfWriter()
+    for i, page in enumerate(reader.pages):
+        page.merge_page(overlay_reader.pages[i])
+        writer.add_page(page)
+
+    tmp_path = pdf_path + '.tmp_pages'
+    with open(tmp_path, 'wb') as f:
+        writer.write(f)
+    os.replace(tmp_path, pdf_path)
+    return total_pages
 
 
 def list_module_quizzes(module_number: int) -> List[str]:

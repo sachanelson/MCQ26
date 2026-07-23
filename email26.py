@@ -17,7 +17,10 @@ from typing import Dict, Optional, Tuple, Any
 
 from googleapiclient.discovery import build
 
-from database26 import create_db_engine, get_course_info, get_student_by_code
+from database26 import (
+    create_db_engine, get_course_info, get_student_by_code,
+    queue_outgoing_email, update_outgoing_email_status,
+)
 from token_refresh26 import get_gmail_service
 
 logger = logging.getLogger(__name__)
@@ -261,9 +264,13 @@ def generate_and_send_quiz_feedback(
         }
 
     if not force_send and not get_autosend_status():
+        email_id = queue_outgoing_email(
+            engine, recipient, subject, body, 'quiz_feedback',
+        )
         return {
             'sent': False,
             'reason': 'autosend_disabled',
+            'email_id': email_id,
             'subject': subject,
             'body': body,
             'recipient': recipient,
@@ -283,6 +290,8 @@ def generate_and_send_quiz_feedback(
 
     ok = send_email(service, recipient, subject, body, email_type='quiz_feedback')
     if ok:
+        email_id = queue_outgoing_email(engine, recipient, subject, body, 'quiz_feedback')
+        update_outgoing_email_status(engine, email_id, 'sent')
         return {'sent': True, 'recipient': recipient, 'context': context}
     return {
         'sent': False,
@@ -292,3 +301,15 @@ def generate_and_send_quiz_feedback(
         'body': body,
         'recipient': recipient,
     }
+
+
+def send_queued_email(engine, email_id: int, recipient: str, subject: str, body: str, email_type: str) -> bool:
+    service = get_gmail_service()
+    if service is None:
+        update_outgoing_email_status(engine, email_id, 'failed', 'Unable to create Gmail service')
+        return False
+    if send_email(service, recipient, subject, body, email_type=email_type):
+        update_outgoing_email_status(engine, email_id, 'sent')
+        return True
+    update_outgoing_email_status(engine, email_id, 'failed', 'send_email returned False')
+    return False
