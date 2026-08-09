@@ -44,3 +44,6 @@ parsed_quizzes26/
 *.png
 *.jpg
 *.jpeg
+
+# Archived/defunct code, kept locally but not tracked
+old_defunct/

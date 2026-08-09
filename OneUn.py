@@ -6,70 +6,66 @@ Writer template with randomised or pseudo-random numerical values.
 
 Architecture
 ------------
-* The ODT template defines the layout: number of questions, subparts,
-  answer boxes and graph locations.  OneUn generates exactly one Problem
-  instance per equation in the .txt file (one per question).
-* The .txt definition file defines the equations and the shared variable
-  table.
+* The ODT template defines the layout: question text, subparts, answer
+  boxes, and graph locations. Questions themselves (and the arithmetic used
+  to compute their answers) live entirely in the ODT templates, not in the
+  .txt definition file.
+* The .txt definition file defines only the shared variable and constant
+  tables. OneUn generates exactly one value per variable per student; that
+  value is reused everywhere the variable's token appears (question text,
+  tables, and answer-key expressions).
 * The student code list (entered in the UI) determines how many output
   files are produced — one ODT per student.
 * A plain-text summary log is written alongside the output files recording
   input paths, UI parameters, and the seed used for every student so that
   non-repeating repeat quizzes can be produced later.
-
-Equation syntax (.txt file)
----------------------------
-  Variables are prefixed with $  (e.g. $Vm, $R, $T)
-  Pinned variables (same chosen value across all equations for one student)
-    are prefixed with !$  (e.g. !$T).  The table entry uses $T as usual.
-  Exponentiation:        ^ or **
-  Square root:           root2($x) or $x**(1/2)
-  Natural log:           ln($x)
-  Log base 10:           log10($x)
-  Log arbitrary base:    log2($x)  (any integer base)
-  Arithmetic:            *, /, +, -
-  Multiple equations:    prefix each line with (1), (2), etc.
+* Graphing (PlotGenerator) is currently unreachable in the live workflow:
+  it still expects an Equation object, but equations are no longer parsed
+  from the .txt file. The intent is to parse a plot equation from the
+  {{graph_*}} placeholder's own specification in the ODT template; this is
+  NOT YET IMPLEMENTED (see OneUnODTGenerator._get_equation).
 
 Variable table (tab or comma separated, single shared section)
 --------------------------------------------------------------
   var, varName, varNameShortList, varType, Vmin, Vmax, increment
   $Vm, membrane potential, "Vm,VM", float, -100, 50, 5
-  The 'var' column always uses $ (not !$).
+  Each variable gets one generated value per student, used consistently
+  wherever its token appears. To get independently-varying values (e.g. two
+  different temperatures for two questions), define separate variables such
+  as $T1 and $T2.
 
 Constants table (tab or comma separated, optional section)
 ----------------------------------------------------------
   sym, symName, symNameShortList, symType, value
   #F,  Faraday constant, "F",  float, 96485
   #R,  gas constant,     "R",  float, 8.314
-  In equations use the bare name without prefix (e.g. F, R).
   In the ODT template use #F, #R to substitute the constant value.
 
 Consistency rules (fatal errors if violated)
 --------------------------------------------
-  * Every $-prefixed token in any equation must appear in [VARIABLES].
   * Every #-prefixed token in the ODT template must appear in [CONSTANTS].
-  * Equations must be numbered consecutively starting at 1 when multiple
-    equations are present.
+  * An [EQUATIONS] section anywhere in the .txt file is a fatal error —
+    equations are no longer defined there.
 
 ODT template placeholder frames
 --------------------------------
   Insert text frames (Insert > Frame) in LibreOffice Writer containing one
   of the following placeholder strings as the sole text content:
 
-    {{answer}}        single answer box (for a single-equation quiz)
+    {{answer}}        single answer box (for a single-question document)
     {{answer_1}}      answer box for question 1
     {{answer_1a}}     answer box for question 1, subpart a
-    {{graph}}         graph region (single equation)
+    {{graph}}         graph region (single-question document)
     {{graph_1}}       graph region for question 1
 
-  The numeric suffix determines which Problem instance (equation index)
-  supplies the graph image.  Subpart letters are ignored by the generator
-  but must be present in the template for correct layout.
+  The numeric suffix is just an author-chosen label to keep multiple
+  questions' placeholders distinct. Subpart letters are ignored by the
+  generator but must be present in the template for correct layout.
 
 Substitution in ODT text/tables
 --------------------------------
   $Variable  replaced by the generated value for that variable (from [VARIABLES]).
-             A trailing digit selects a specific equation instance (e.g. $T1).
+             Matched by exact name only.
   #Constant  replaced by the fixed constant value (from [CONSTANTS]).
              Error if the constant is not in the table.
 """
@@ -81,7 +77,7 @@ import re
 import random
 import itertools
 from typing import Dict, List, Optional, Tuple, Any
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from copy import deepcopy
 
@@ -142,12 +138,14 @@ class ConstantDef:
 
 @dataclass
 class Equation:
-    """Parsed equation."""
+    """Parsed equation. Currently only constructed ad-hoc by PlotGenerator
+    (see _eval_for_y) since equations are no longer parsed from the .txt
+    file. Retained to support graphing once equations can be parsed from
+    the {{graph_*}} placeholder specification (not yet implemented)."""
     index: int               # equation number (1-based), 0 if single un-numbered
     raw: str                 # original equation string
-    expression: str          # normalized Python-evaluable expression
-    variables: List[str]     # $-prefixed variable names (canonical, no !)
-    pinned: List[str]        # subset of variables prefixed !$ in source
+    expression: str          # Python-evaluable expression
+    variables: List[str]     # $-prefixed variable names
 
 
 @dataclass
@@ -156,87 +154,26 @@ class ProblemDefinition:
     equations: List[Equation]
     variables: Dict[str, VariableDef]   # keyed by $var name
     constants: Dict[str, ConstantDef]   # keyed by #sym name
-    pinned_vars: List[str]              # union of all pinned vars across equations
 
 
 @dataclass
 class Problem:
     """A single generated problem instance."""
-    given_values: Dict[str, Any]   # values drawn for the variables in this equation
+    given_values: Dict[str, Any]   # values drawn for every variable, for this student
     equation_index: int            # which equation this instance corresponds to (0 = single/first)
-    extra_values: Dict[str, Any] = field(default_factory=dict)  # values for template-only variables
 
 
 # ---------------------------------------------------------------------------
 # Equation Parser
+#
+# Only `evaluate()` is currently used, by PlotGenerator, to support graphing.
+# Equations are no longer parsed from the .txt file (see ProblemDefinitionParser);
+# the plan is to eventually parse an Equation from the {{graph_*}} placeholder's
+# own specification in the ODT template (not yet implemented).
 # ---------------------------------------------------------------------------
 
 class EquationParser:
-    """Parses equation strings into Python-evaluable expressions."""
-
-    # Matches !$var (pinned) or $var (regular) — captures the $ and name
-    VAR_PATTERN = re.compile(r'(!?\$[A-Za-z_][A-Za-z0-9_]*)')
-
-    # Pattern for log with arbitrary base: log<N>(expr)
-    LOG_BASE_PATTERN = re.compile(r'\blog(\d+)\(([^)]+)\)')
-
-    @classmethod
-    def parse(cls, raw_line: str) -> Equation:
-        """Parse a single equation line.
-
-        Args:
-            raw_line: Raw equation string, possibly prefixed with (N)
-
-        Returns:
-            Equation object with normalized expression, pinned list, and constants.
-        """
-        line = raw_line.strip()
-
-        # Check for equation index prefix like (1), (2)
-        index = 0
-        idx_match = re.match(r'^\((\d+)\)\s*', line)
-        if idx_match:
-            index = int(idx_match.group(1))
-            line = line[idx_match.end():]
-
-        # Collect all $-prefixed token matches (includes !$ prefixed ones)
-        raw_tokens = cls.VAR_PATTERN.findall(line)
-        pinned = sorted(set(t.lstrip('!') for t in raw_tokens if t.startswith('!$')))
-        variables = sorted(set(t.lstrip('!') for t in raw_tokens))
-
-        # Strip ! from expression so it is evaluable using $var names
-        clean_line = line.replace('!$', '$')
-
-        # Normalize the expression
-        expr = cls._normalize(clean_line)
-
-        return Equation(index=index, raw=raw_line.strip(),
-                        expression=expr, variables=variables,
-                        pinned=pinned)
-
-    @classmethod
-    def _normalize(cls, expr: str) -> str:
-        """Convert equation syntax to Python-evaluable expression."""
-        # Replace ^ with ** for exponentiation
-        expr = expr.replace('^', '**')
-
-        # Handle root2(x) -> math.sqrt(x)
-        expr = re.sub(r'root2\(', 'math.sqrt(', expr)
-
-        # Handle ln(x) -> math.log(x)
-        expr = re.sub(r'\bln\(', 'math.log(', expr)
-
-        # Handle log10(x) -> math.log10(x)
-        expr = re.sub(r'\blog10\(', 'math.log10(', expr)
-
-        # Handle log<base>(expr) -> math.log(expr)/math.log(base)
-        def replace_log_base(m):
-            base = m.group(1)
-            inner = m.group(2)
-            return f'(math.log({inner})/math.log({base}))'
-        expr = cls.LOG_BASE_PATTERN.sub(replace_log_base, expr)
-
-        return expr
+    """Evaluates parsed equation expressions. Retained to support graphing."""
 
     @classmethod
     def evaluate(cls, equation: Equation, var_values: Dict[str, Any],
@@ -599,7 +536,6 @@ class ProblemDefinitionParser:
             equations=[],
             variables=variables,
             constants=constants,
-            pinned_vars=[]
         )
 
 
@@ -608,13 +544,10 @@ class ProblemDefinitionParser:
 # ---------------------------------------------------------------------------
 
 class ProblemGenerator:
-    """Generates one Problem instance per equation for a single student.
-
-    Pinned variables (!$var) receive the same randomly-chosen value across
-    all equations for a given student.  Other variables are independently
-    sampled per equation.
-
-    The generator does NOT solve the equation — that is the student's job.
+    """Generates one Problem instance per student, containing a single value
+    for every variable in the definition. That value is reused everywhere the
+    variable's token appears in the ODT template (question text, tables, and
+    answer-key expressions).
     """
 
     def __init__(self, definition: ProblemDefinition):
@@ -648,20 +581,18 @@ class ProblemGenerator:
         self._pseudo_random_indices[1] = 0
 
     def generate_for_student(self, mode: str = 'random',
-                             seed: Optional[int] = None,
-                             extra_var_names: Optional[List[str]] = None) -> List[Problem]:
-        """Generate one Problem per equation for a single student.
+                             seed: Optional[int] = None) -> List[Problem]:
+        """Generate one Problem for a single student, with a value for every
+        variable in the definition.
 
         Args:
             mode: 'random' — values chosen randomly from allowed values.
                   'pseudo_random' — values chosen in random order from the
                   complete set of allowed value combinations without reuse.
             seed: Random seed.  The caller is responsible for tracking seeds.
-            extra_var_names: Names of variables used in the ODT template but not
-                in any equation.  A value for each is generated once per student.
 
         Returns:
-            List of Problem objects, one per equation, in equation order.
+            A single-element list containing the generated Problem.
         """
         # Pseudo random pools are built once (with the first seed) and then
         # consumed across all students so that no combination is reused.
@@ -861,15 +792,13 @@ class TemplateProcessor:
 
     Variables in text/tables: simply type the variable name from the .txt file
     (e.g. ``$Kin`` or ``$T1``).  The processor replaces it with the generated
-    value.  A trailing integer can select the equation instance (``$T_1`` is not
-    supported; use ``$T1`` when the table defines ``$T`` and you want equation 1's
-    value).  The exact variable name always takes precedence.
+    value, matched by exact name only.  To get an independently-drawn value for
+    a second question, define a separate variable (e.g. ``$T1`` and ``$T2``)
+    rather than reusing one name.
     """
 
     # Regex for $VarName tokens in text
     _VAR_RE = re.compile(r'\$[A-Za-z_][A-Za-z0-9_]*')
-    # Regex for trailing digits used as equation index
-    _VAR_INDEX_RE = re.compile(r'^(\$[A-Za-z_][A-Za-z0-9_]*?)(\d+)$')
     # Regex for #ConstName tokens in text
     _CONST_RE = re.compile(r'#[A-Za-z_][A-Za-z0-9_]*')
 
@@ -906,7 +835,7 @@ class TemplateProcessor:
         graph_images = graph_images or {}
         problems = problems or []
         definition = definition or ProblemDefinition(
-            equations=[], variables={}, constants={}, pinned_vars=[]
+            equations=[], variables={}, constants={}
         )
 
         # Work in a temp directory
@@ -989,38 +918,6 @@ class TemplateProcessor:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
         return output_path
-
-    @staticmethod
-    def extract_variable_names(template_path: str) -> set:
-        """Return all $Variable tokens found in the ODT template body."""
-        import zipfile
-        from lxml import etree
-        names = set()
-        with zipfile.ZipFile(template_path, 'r') as z:
-            with z.open('content.xml') as f:
-                tree = etree.parse(f)
-        for elem in tree.iter():
-            for attr in ('text', 'tail'):
-                text = getattr(elem, attr, None)
-                if text:
-                    names.update(TemplateProcessor._VAR_RE.findall(text))
-        return names
-
-    @staticmethod
-    def extract_constant_names(template_path: str) -> set:
-        """Return all #Constant tokens found in the ODT template body."""
-        import zipfile
-        from lxml import etree
-        names = set()
-        with zipfile.ZipFile(template_path, 'r') as z:
-            with z.open('content.xml') as f:
-                tree = etree.parse(f)
-        for elem in tree.iter():
-            for attr in ('text', 'tail'):
-                text = getattr(elem, attr, None)
-                if text:
-                    names.update(TemplateProcessor._CONST_RE.findall(text))
-        return names
 
     @staticmethod
     def _format_value(value: Any, var_def: Optional[VariableDef]) -> str:
@@ -1266,17 +1163,10 @@ class TemplateProcessor:
     def _substitute_variables(self, root, problems: List[Problem],
                               definition: ProblemDefinition, ns: Dict):
         """Replace $VarName tokens in text nodes with generated values."""
-        # Build a value lookup table.
-        # exact_values: first-seen value for each exact variable name
-        # eq_values: per-equation values for $Var_N style lookups
+        # Build a value lookup table keyed by exact variable name.
         exact_values: Dict[str, Any] = {}
-        eq_values: Dict[int, Dict[str, Any]] = {}
-        for p in sorted(problems, key=lambda x: x.equation_index):
-            eq_values[p.equation_index] = dict(p.given_values)
+        for p in problems:
             for var_name, val in p.given_values.items():
-                if var_name not in exact_values:
-                    exact_values[var_name] = val
-            for var_name, val in p.extra_values.items():
                 if var_name not in exact_values:
                     exact_values[var_name] = val
 
@@ -1529,7 +1419,7 @@ class OneUnODTGenerator:
 
         if definition is None:
             definition = ProblemDefinition(
-                equations=[], variables={}, constants={}, pinned_vars=[])
+                equations=[], variables={}, constants={})
 
         out_stem = os.path.splitext(output_path)[0]
         base_dir = os.path.dirname(os.path.abspath(output_path))
@@ -1539,21 +1429,6 @@ class OneUnODTGenerator:
         generated_files: List[str] = []
         student_seeds: Dict[str, Any] = {}
 
-        # Determine which variables are referenced in the ODT template but not in
-        # any equation; these are generated once per student as extra values.
-        odt_var_tokens = self.template_processor.extract_variable_names(template_path)
-        vars_in_equations = set(v for eq in definition.equations for v in eq.variables)
-        extra_var_names: List[str] = []
-        for token in sorted(odt_var_tokens):
-            if token in definition.variables and token not in vars_in_equations:
-                extra_var_names.append(token)
-            else:
-                m = TemplateProcessor._VAR_INDEX_RE.match(token)
-                if m:
-                    stem = m.group(1)
-                    if stem in definition.variables and stem not in vars_in_equations:
-                        extra_var_names.append(stem)
-
         for idx, student_code in enumerate(student_codes):
             # Derive a per-student seed
             if base_seed is not None:
@@ -1562,9 +1437,9 @@ class OneUnODTGenerator:
                 student_seed = None
             student_seeds[student_code or f'generic_{idx}'] = student_seed
 
-            # Generate one Problem per equation for this student
+            # Generate the Problem (one value per variable) for this student
             problems = generator.generate_for_student(
-                mode=mode, seed=student_seed, extra_var_names=extra_var_names
+                mode=mode, seed=student_seed
             )
 
             # Build graph images dict: graph_N -> png_path for each equation
@@ -1732,7 +1607,14 @@ class OneUnODTGenerator:
 
     @staticmethod
     def _get_equation(definition: 'ProblemDefinition', eq_index: int) -> Optional['Equation']:
-        """Return the equation matching eq_index (1-based), or first if not found."""
+        """Return the equation matching eq_index (1-based), or first if not found.
+
+        TODO: `definition.equations` is always empty now that equations are no
+        longer parsed from the .txt file, so this always returns None and
+        graphing is currently a no-op. The plot equation should instead be
+        parsed from the {{graph_*}} placeholder's own specification in the ODT
+        template. Not yet implemented.
+        """
         if not definition.equations:
             return None
         for eq in definition.equations:
@@ -1827,43 +1709,3 @@ def get_odt_template_page_count(template_path: str) -> Optional[int]:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Main (for testing)
-# ---------------------------------------------------------------------------
-
-if __name__ == '__main__':
-    # Test: R, F, z are constants; E, T, Cout, Cin are variables
-    test_content = """
-[EQUATIONS]
-(1) $E = (R * $T) / (z * F) * ln($Cout / $Cin)
-
-[VARIABLES]
-var, varName, varNameShortList, varType, Vmin, Vmax, increment
-$E, equilibrium potential, "E,Eeq", float, -100, 50, 0.1
-$T, temperature, "T,Temp", float, 293, 313, 5
-$Cout, outside concentration, "Cout,Co", float, 1, 150, 5
-$Cin, inside concentration, "Cin,Ci", float, 1, 150, 5
-
-[CONSTANTS]
-sym, symName, symNameShortList, symType, value
-#R, gas constant, "R", float, 8.314
-#F, Faraday constant, "F", float, 96485
-#z, valence, "z", int, 1
-"""
-
-    definition = ProblemDefinitionParser.parse_text(test_content)
-    print(f"Parsed {len(definition.equations)} equation(s)")
-    print(f"Parsed {len(definition.variables)} variable(s)")
-    print(f"Parsed {len(definition.constants)} constant(s)")
-    print(f"Pinned vars: {definition.pinned_vars}")
-
-    problems = generate_problems_for_student(definition, mode='random', seed=42)
-    for p in problems:
-        print(f"\nEquation {p.equation_index} values:")
-        for var_name, val in sorted(p.given_values.items()):
-            vdef = definition.variables.get(var_name)
-            label = vdef.var_name if vdef else var_name
-            print(f"    {label} = {val}")
-    print("\nConstants:")
-    for sym, cdef in sorted(definition.constants.items()):
-        print(f"    {cdef.sym_name} ({sym}) = {cdef.value}")
