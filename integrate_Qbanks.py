@@ -54,12 +54,18 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
+
+from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-COURSE_ROOT = Path(os.path.expanduser("~/textProcessing/NBIO140_modules_2026"))
+OLD_COURSE_ROOT = Path(os.path.expanduser("~/textProcessing/NBIO 140B"))
+NEW_COURSE_ROOT = Path(os.path.expanduser("~/textProcessing/NBIO140_2026"))
+COURSE_ROOT = OLD_COURSE_ROOT
 
 # ── File-discovery helpers ────────────────────────────────────────────────────
 
@@ -126,8 +132,27 @@ def _discover_banks(q_dir: Path):
     return sorted(keys, key=lambda x: (x[0], int(x[1])))
 
 
+def _parse_date(date_str: str):
+    """Parse a filename date like 'Aug0725' into a datetime, or None."""
+    from datetime import datetime
+    try:
+        return datetime.strptime(date_str, '%b%d%y')
+    except ValueError:
+        return None
+
+
+def _file_sort_key(path: Path):
+    """Return a sort key that prefers filename dates, then file mtime."""
+    m = _FILE_RE.match(path.name)
+    if m:
+        d = _parse_date(m.group('date'))
+        if d:
+            return (d, path.stat().st_mtime)
+    return (None, path.stat().st_mtime)
+
+
 def _find_file(directory: Path, prefix: str, letter: str, bank: str):
-    """Find the single file matching prefix+letter+bank in directory."""
+    """Find the most recent file matching prefix+letter+bank in directory."""
     if directory is None or not directory.is_dir():
         return None
     pattern = re.compile(
@@ -137,7 +162,11 @@ def _find_file(directory: Path, prefix: str, letter: str, bank: str):
     matches = [f for f in directory.iterdir() if pattern.match(f.name)]
     # Exclude Overlap_ files
     matches = [f for f in matches if not f.name.startswith("Overlap_")]
-    return matches[0] if len(matches) == 1 else (matches[0] if matches else None)
+    if not matches:
+        return None
+    # Sort by filename date (newest first), with mtime as fallback
+    matches.sort(key=_file_sort_key, reverse=True)
+    return matches[0]
 
 
 # ── Parsing helpers ───────────────────────────────────────────────────────────
@@ -145,28 +174,24 @@ def _find_file(directory: Path, prefix: str, letter: str, bank: str):
 def _parse_header(text: str):
     """Extract the JSON header block and return (header_dict, body_text).
 
-    The header format is:
-        # {
-          "key": "value",
-          ...
-        }
-        <blank line>
-        <questions body>
-
-    Only the very first line carries the '# ' prefix; the remaining JSON lines
-    are plain.  The block ends at the first line that is exactly '}'.
+    Handles both source-style headers (only the first line '# {') and
+    integrated-style headers (every line prefixed with '# ').
     """
     lines = text.splitlines()
     if not lines or not lines[0].strip().startswith("# {"):
         return None, text.strip()
 
-    # Collect JSON lines: first line strips the leading '# '
+    # Collect JSON lines, stripping a leading '# ' prefix if present.
     json_lines = [lines[0].strip()[2:]]  # '# {' → '{'
     body_start = 1
     for i, line in enumerate(lines[1:], 1):
-        json_lines.append(line)
+        s = line.strip()
+        if s.startswith('# '):
+            json_lines.append(s[2:])
+        else:
+            json_lines.append(s)
         body_start = i + 1
-        if line.strip() == "}":
+        if s == "}" or s.startswith("# }"):
             break
 
     header_dict = None
@@ -240,6 +265,24 @@ def integrate_bank(q_dir, a_dir, f_dir, c_dir, prefix, bank_num, *, test=False):
     _,      f_entries = _load_component(f_file)
     _,      c_entries = _load_component(c_file)
 
+    # Warn if component entry counts do not match
+    counts = {
+        'Questions': (q_file, len(q_entries)),
+        'Answers': (a_file, len(a_entries)),
+        'Feedback': (f_file, len(f_entries)),
+        'Context': (c_file, len(c_entries)),
+    }
+    present = [(name, path, n) for name, (path, n) in counts.items() if path is not None]
+    if present:
+        nums = [n for _, _, n in present]
+        if max(nums) != min(nums):
+            print(
+                f"  [WARNING] Component entry counts do not match for {prefix}{bank_num}:",
+                file=sys.stderr,
+            )
+            for name, path, n in present:
+                print(f"    {name:10s} {path.name}: {n} entries", file=sys.stderr)
+
     if not q_entries:
         # Check whether the file has content but uses a different ID scheme
         # (e.g. module-0 algorithmic banks like "FVC011265c0000 …")
@@ -271,27 +314,41 @@ def integrate_bank(q_dir, a_dir, f_dir, c_dir, prefix, bank_num, *, test=False):
 
     for qid in sorted_ids:
         lines.append(f"{qid}.")
-        lines.append("Question:")
-        lines.append(q_entries[qid])
+
+        # Question: <stem> on one line, then a blank line, then choices
+        q_lines = q_entries[qid].splitlines()
+        stem_idx = 0
+        while stem_idx < len(q_lines) and not q_lines[stem_idx].strip():
+            stem_idx += 1
+        stem = q_lines[stem_idx].strip() if stem_idx < len(q_lines) else ""
+        choice_idx = stem_idx + 1
+        while choice_idx < len(q_lines) and not q_lines[choice_idx].strip():
+            choice_idx += 1
+        choices = q_lines[choice_idx:]
+        while choices and not choices[-1].strip():
+            choices.pop()
+        lines.append(f"Question: {stem}")
+        lines.append("")  # blank line after the question stem
+        lines.extend(choices)
 
         ans = a_entries.get(qid, "").strip()
         if ans:
             # Strip "Correct Answer: " prefix if present
             ans = re.sub(r"^Correct Answer:\s*", "", ans, flags=re.IGNORECASE)
-            lines.append("Answer:")
-            lines.append(ans)
+            ans = ' '.join(ans.split())
+            lines.append(f"Answer: {ans}")
 
         fb = f_entries.get(qid, "").strip()
         if fb:
             # Strip "Review: " prefix if present
             fb = re.sub(r"^Review:\s*", "", fb, flags=re.IGNORECASE)
-            lines.append("Feedback:")
-            lines.append(fb)
+            fb = ' '.join(fb.split())
+            lines.append(f"Feedback: {fb}")
 
         ctx = c_entries.get(qid, "").strip()
         if ctx:
-            lines.append("Context:")
-            lines.append(ctx)
+            ctx = ' '.join(ctx.split())
+            lines.append(f"Context: {ctx}")
 
         lines.append("")  # blank line between questions
 
@@ -354,11 +411,108 @@ def process_module(module_num: int, *, test: bool = False):
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
+def _merge_header_for_output(src_header, new_header):
+    """Start from the source header, but keep the new course module number."""
+    hdr = dict(src_header) if src_header else {}
+    if new_header:
+        if 'module' in new_header:
+            hdr['module'] = new_header['module']
+        # Preserve other new-course metadata only if missing in source
+        for key in ('course number', 'course title', 'instructors', 'author'):
+            if key in new_header and key not in hdr:
+                hdr[key] = new_header[key]
+    hdr['integrated'] = True
+    hdr.pop('element', None)
+    hdr['timestamp'] = datetime.now().isoformat()
+    return hdr
+
+
+def offer_convert_all(app):
+    """Ask whether to convert all old modules; exit on No."""
+    reply = QMessageBox.question(
+        None,
+        "Convert all old modules?",
+        "You cancelled the single-file selection.\nConvert all old modules now?",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.No,
+    )
+    if reply == QMessageBox.StandardButton.No:
+        print("Cancelled.")
+        sys.exit(0)
+    print("\nConverting all old modules...")
+    for n in range(26):
+        process_module(n, test=False)
+    print("Done.")
+    sys.exit(0)
+
+
+def gui_reintegrate():
+    """Default GUI workflow: re-integrate one existing integrated file."""
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
+
+    new_path_str, _ = QFileDialog.getOpenFileName(
+        None,
+        "Select integrated qbank in new course",
+        str(NEW_COURSE_ROOT),
+        "Integrated Banks (*_INT.txt);;Text Files (*.txt)",
+    )
+    if not new_path_str:
+        offer_convert_all(app)
+        return
+    new_path = Path(new_path_str)
+
+    q_file_str, _ = QFileDialog.getOpenFileName(
+        None,
+        "Select old course Question file",
+        str(OLD_COURSE_ROOT),
+        "Question Files (M*Q*_*.txt);;Text Files (*.txt)",
+    )
+    if not q_file_str:
+        offer_convert_all(app)
+        return
+    q_file = Path(q_file_str)
+
+    m = _FILE_RE.match(q_file.name)
+    if m is None:
+        print(f"Selected file does not match the expected naming pattern: {q_file.name}", file=sys.stderr)
+        return
+    source_prefix = m.group('prefix')
+    source_bank = m.group('bank')
+
+    qbanks_dir = q_file.parent.parent
+    dirs = _component_dirs(qbanks_dir)
+    if dirs is None:
+        print(f"No component directories found alongside {q_file.parent}", file=sys.stderr)
+        return
+    q_dir, a_dir, f_dir, c_dir = dirs
+
+    integrated_text = integrate_bank(
+        q_dir, a_dir, f_dir, c_dir, source_prefix, source_bank, test=False
+    )
+    if integrated_text is None:
+        print("Integration failed.", file=sys.stderr)
+        return
+
+    src_header, body = _parse_header(integrated_text)
+    new_header, _ = _parse_header(new_path.read_text(encoding='utf-8'))
+    out_header = _merge_header_for_output(src_header, new_header)
+
+    out_lines = ['# ' + json.dumps(out_header, indent=2).replace('\n', '\n# ')]
+    out_lines.append('')
+    out_lines.append(body)
+    out_text = '\n'.join(out_lines) + '\n'
+
+    new_path.write_text(out_text, encoding='utf-8')
+    print(f"Wrote re-integrated file to {new_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Integrate QBank component files into combined files."
     )
-    group = parser.add_mutually_exclusive_group(required=True)
+    group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument(
         "--test", metavar="MODULE", type=int,
         help="Run in test mode on MODULE (preview to stdout, no files written).",
@@ -369,7 +523,7 @@ def main():
     )
     group.add_argument(
         "--all", action="store_true",
-        help="Process all modules 0-25 and write integrated files.",
+        help="Process all old-course modules 0-25 and write integrated files.",
     )
     args = parser.parse_args()
 
@@ -380,6 +534,8 @@ def main():
     elif args.all:
         for n in range(26):
             process_module(n, test=False)
+    else:
+        gui_reintegrate()
 
 
 if __name__ == "__main__":

@@ -42,6 +42,9 @@ class EnrolledStudentsDialog(QDialog):
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self.table)
         buttons = QHBoxLayout()
+        add_button = QPushButton('Add Student')
+        add_button.clicked.connect(self._add_student_row)
+        buttons.addWidget(add_button)
         remove_button = QPushButton('Remove Selected Student')
         remove_button.clicked.connect(self._remove_selected_student)
         buttons.addWidget(remove_button)
@@ -57,7 +60,12 @@ class EnrolledStudentsDialog(QDialog):
 
     def _load_students(self):
         self.table.setRowCount(0)
-        for student in get_all_students(self.engine):
+
+        def _second_name_key(name):
+            parts = (name or '').strip().split()
+            return parts[1].casefold() if len(parts) >= 2 else (parts[0] if parts else '').casefold()
+
+        for student in sorted(get_all_students(self.engine), key=lambda s: _second_name_key(s.name)):
             row = self.table.rowCount()
             self.table.insertRow(row)
             name_item = QTableWidgetItem(student.name or '')
@@ -66,6 +74,17 @@ class EnrolledStudentsDialog(QDialog):
             self.table.setItem(row, 1, QTableWidgetItem(student.student_code or ''))
             section = '' if student.section_number is None else str(student.section_number)
             self.table.setItem(row, 2, QTableWidgetItem(section))
+
+    def _add_student_row(self):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        name_item = QTableWidgetItem('')
+        name_item.setData(Qt.ItemDataRole.UserRole, None)
+        self.table.setItem(row, 0, name_item)
+        self.table.setItem(row, 1, QTableWidgetItem(''))
+        self.table.setItem(row, 2, QTableWidgetItem(''))
+        self.table.setCurrentCell(row, 0)
+        self.table.editItem(self.table.item(row, 0))
 
     def _remove_selected_student(self):
         row = self.table.currentRow()
@@ -279,9 +298,9 @@ class CourseInfoPanel(QWidget):
 
         # ---- Sections table ----
         layout.addWidget(QLabel("Course Sections:"))
-        self.sections_table = QTableWidget(0, 8)
+        self.sections_table = QTableWidget(0, 9)
         self.sections_table.setHorizontalHeaderLabels(
-            ["#", "Day", "Start", "End", "Meeting Dates", "Classroom", "TA / Instructor", "Comment"])
+            ["#", "Day", "Start", "End", "Meeting Dates", "Classroom", "TA / Instructor", "Comment", "Code"])
         self.sections_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         for col in range(1, 8):
             self.sections_table.horizontalHeader().setSectionResizeMode(
@@ -523,7 +542,7 @@ class CourseInfoPanel(QWidget):
         row = self.sections_table.rowCount()
         self.sections_table.insertRow(row)
         for col, key in enumerate(['section_number', 'day_of_week', 'start_time',
-                                    'end_time', 'meeting_dates', 'classroom', 'ta_instructor', 'comment']):
+                                    'end_time', 'meeting_dates', 'classroom', 'ta_instructor', 'comment', 'code']):
             if key == 'meeting_dates':
                 item = QTableWidgetItem(self._format_meeting_dates(sec.get(key, [])))
                 self.sections_table.setItem(row, col, item)
@@ -621,6 +640,7 @@ class CourseInfoPanel(QWidget):
                 'classroom':      _cell(5),
                 'ta_instructor':  _cell(6),
                 'comment':        _cell(7),
+                'code':           _cell(8),
             })
             self._save_section_meetings(section_number, meeting_dates, start_time, end_time)
 

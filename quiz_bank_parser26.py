@@ -135,7 +135,7 @@ def load_integrated_bank(path: str) -> List[Dict]:
 
         # Question stem
         if stripped.lower().startswith('question:'):
-            current['stem'] = re.sub(r'^Question:\s*', '', stripped, flags=re.IGNORECASE)
+            current['stem'] = re.sub(r'^Question:\s*', '', stripped, flags=re.IGNORECASE).lstrip(': ').strip()
             continue
 
         # Answer choices A-E

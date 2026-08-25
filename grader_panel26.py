@@ -4,16 +4,18 @@ import os
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox, QLabel,
     QLineEdit, QPushButton, QFileDialog, QDateEdit, QCheckBox, QComboBox,
-    QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
+    QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, QDialog,
 )
 from PyQt6.QtCore import QDate, Qt
 
 from database26 import (
-    get_course_info, get_section_meetings, get_section_meeting_grades,
-    get_students_for_section, save_section_meeting_grade,
+    get_course_info, get_quiz_score_by_quiz_id, get_section_meetings,
+    get_section_meeting_grades, get_students_for_section, save_section_meeting_grade,
 )
-from grading26 import grade_and_record_scan_file, parse_scan_file
-from section_workspace26 import export_meeting_grades
+from grading26 import parse_scan_file, record_results, resolve_held_up_result
+from grading_session26 import start_grading_session
+from unresolved_scan_dialog26 import UnresolvedScanDialog
+# from section_workspace26 import export_meeting_grades
 
 
 class GraderPanel(QWidget):
@@ -34,14 +36,6 @@ class GraderPanel(QWidget):
         scan_browse.clicked.connect(self._browse_scan)
         scan_row.addWidget(scan_browse)
         form.addRow('Scan PDF:', scan_row)
-
-        self.qsession_folder = QLineEdit()
-        folder_row = QHBoxLayout()
-        folder_row.addWidget(self.qsession_folder)
-        folder_browse = QPushButton('Browse…')
-        folder_browse.clicked.connect(self._browse_qsession_folder)
-        folder_row.addWidget(folder_browse)
-        form.addRow('Qsession Folder:', folder_row)
 
         self.date_taken = QDateEdit()
         self.date_taken.setCalendarPopup(True)
@@ -66,7 +60,10 @@ class GraderPanel(QWidget):
         self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.results_table)
-        self.status_label = QLabel('Select a scan PDF and its qsession folder.')
+        self.status_label = QLabel(
+            'Select a scan PDF and click Grade Scan. A grading session folder is created '
+            'automatically under <course_folder>/grading/<date>/<date><letter>/.'
+        )
         layout.addWidget(self.status_label)
 
         section_group = QGroupBox('Section Meeting Grades')
@@ -103,41 +100,87 @@ class GraderPanel(QWidget):
         if path:
             self.scan_path.setText(path)
 
-    def _browse_qsession_folder(self):
-        start = self._course_folder()
-        path = QFileDialog.getExistingDirectory(self, 'Select Qsession Folder', start)
-        if path:
-            self.qsession_folder.setText(path)
-
     def _course_folder(self):
         return get_course_info(self.engine).get('course_folder', '') or os.path.expanduser('~')
 
     def _grade_scan(self):
         scan_path = self.scan_path.text().strip()
-        qsession_folder = self.qsession_folder.text().strip()
         if not scan_path or not os.path.isfile(scan_path):
             QMessageBox.warning(self, 'Missing Scan', 'Select an existing scan PDF.')
             return
-        if not qsession_folder or not os.path.isdir(qsession_folder):
-            QMessageBox.warning(self, 'Missing Qsession Folder', 'Select an existing qsession folder.')
+        course_folder = self._course_folder()
+        if not course_folder or not os.path.isdir(course_folder):
+            QMessageBox.warning(self, 'Missing Course Folder', 'Set the course folder in Course Info first.')
             return
+
         try:
-            results = parse_scan_file(scan_path)
-            recorded = grade_and_record_scan_file(
-                self.engine,
-                scan_path,
-                qsession_folder,
-                date_taken=self.date_taken.date().toString('yyyy-MM-dd'),
-                send_feedback=self.send_feedback.isChecked(),
-            )
+            session_info = start_grading_session(self.engine, course_folder, scan_path)
+            grading_dir = str(session_info['directory'])
+            results = parse_scan_file(self.engine, scan_path, grading_dir, course_folder)
         except Exception as error:
             QMessageBox.critical(self, 'Could Not Grade Scan', str(error))
             return
+
+        for result in results:
+            self._resolve_if_needed(result, course_folder)
+            if not result.held_up:
+                self._confirm_overwrite_if_needed(result)
+
+        to_record = [r for r in results if not r.held_up and not r.overwrite_declined]
+        recorded = record_results(
+            self.engine, to_record, grading_dir,
+            grading_session_id=session_info['grading_session_id'],
+            date_taken=self.date_taken.date().toString('yyyy-MM-dd'),
+            send_feedback=self.send_feedback.isChecked(),
+        )
         self._show_results(results, recorded)
         self.status_label.setText(
-            f'Processed {len(results)} quiz result(s); recorded {len(recorded)} quiz attempt(s) at '
-            f'{datetime.now().strftime("%H:%M:%S")}.'
+            f"Grading session {session_info['session_date']}{session_info['letter']} "
+            f"({grading_dir}): processed {len(results)} quiz result(s); "
+            f'recorded {len(recorded)} quiz attempt(s) at {datetime.now().strftime("%H:%M:%S")}.'
         )
+
+    def _resolve_if_needed(self, result, course_folder):
+        """Prompt the grader to identify a scan whose QR code could not be read.
+
+        Keeps prompting on invalid input until the grader resolves it or
+        chooses to skip (Cancel), in which case the result stays unrecorded.
+        """
+        while result.held_up:
+            dialog = UnresolvedScanDialog(result.unresolved_image_path, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            module_number, student_code, quiz_number = dialog.values()
+            if not student_code:
+                QMessageBox.warning(self, 'Missing Student Code', 'Enter a student code.')
+                continue
+            try:
+                resolve_held_up_result(
+                    self.engine, result, module_number, student_code, quiz_number, course_folder,
+                )
+            except Exception as error:
+                QMessageBox.warning(self, 'Could Not Resolve Scan', str(error))
+
+    def _confirm_overwrite_if_needed(self, result):
+        """Ask before overwriting a quiz that was already graded with a different score.
+
+        This is what happens when the same physical quiz is graded a second
+        time (e.g. re-scanning to fix a misread or an earlier bad manual
+        resolution): re-recording it updates the existing attempt in place,
+        so we confirm with the grader first.
+        """
+        existing_score = get_quiz_score_by_quiz_id(self.engine, result.quiz_id)
+        new_score = round(result.total_score)
+        if existing_score is None or existing_score == new_score:
+            return
+        answer = QMessageBox.question(
+            self, 'Overwrite Existing Score?',
+            f'Quiz {result.quiz_id} was already graded with score {existing_score}.\n'
+            f'Overwrite it with the new score of {new_score}?',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            result.overwrite_declined = True
 
     def _show_results(self, results, recorded):
         recorded_ids = {getattr(quiz, 'quiz_id', '') for quiz in recorded}
@@ -145,7 +188,9 @@ class GraderPanel(QWidget):
         for row, result in enumerate(results):
             status = 'Recorded' if result.quiz_id in recorded_ids else 'Not recorded'
             if result.held_up:
-                status = 'Held up'
+                status = 'Unresolved'
+            elif result.overwrite_declined:
+                status = 'Skipped (not overwritten)'
             values = [
                 result.quiz_id,
                 result.student_code or '',

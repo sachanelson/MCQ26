@@ -139,6 +139,7 @@ the text content is matched.
 | `{{graph}}`     | Graph image region (single-question document)   |
 | `{{graph_1}}`   | Graph image for question 1                      |
 | `{{graph_2}}`   | Graph image for question 2                      |
+| `{{answer_1a; 2}}` | Same as `{{answer_1a}}`; `; 2` records 2 points |
  
 **Rules:**
 - The numeric suffix (1, 2, …) is just a label you choose to keep multiple
@@ -146,6 +147,9 @@ the text content is matched.
   the `.txt` file (which no longer defines equations or question numbers).
 - Sub-part letters (`a`, `b`, …) in answer placeholders are recorded but
   ignored by the generator — they exist for your layout reference only.
+- An optional point value may follow a semicolon after the placeholder name,
+  e.g. `{{answer_1a; 2}}` or `{{answer_1; 3 points}}`. It is captured but not
+  used by the current generator and will not affect answer rendering.
 - `{{answer_*}}` frames are cleared to become blank student answer regions.
 - `{{graph_*}}` frames are replaced by the generated PNG plot.
 - All other content (text, tables, existing images, styles, calibration marks)
@@ -170,21 +174,43 @@ are processed.** This means any `$Var` / `#Const` tokens you type inside an
 answer-key frame are already replaced with that student's generated values by
 the time the frame content is interpreted below.
 
-An `{{answer_*}}` frame in an answer-key template must contain **exactly two
-non-blank lines**:
+An `{{answer_*}}` frame in an answer-key template must contain its
+`{{answer...}}` placeholder line (with an optional `; <points>` suffix such as
+`{{answer_1a; 2}}`) followed by **one or two non-blank answer lines**. The
+placeholder line itself does not count toward that limit. A "line" means a
+separate **paragraph** (i.e. you pressed Return/Enter to start it) — not a
+visually wrapped line. If your equation is long and word-wraps within the
+frame because the frame is narrow, that is purely a rendering effect:
+LibreOffice does not insert any paragraph break or line-break markup for
+wrapped text, so it still counts as a single line and will not trip this
+check. Only an actual Enter (new paragraph) or Shift+Enter (soft line break)
+inside the frame would count against the limit — avoid both within an
+`<answer line>` itself.
 
 ```
 {{answer_1a}}
 <answer line>
 ```
 
-The `<answer line>` is interpreted according to three conventions:
+or, with two answer lines (e.g. a literal restatement followed by a computed
+reduction):
+
+```
+{{answer_1a}}
+<answer line 1>
+<answer line 2>
+```
+
+Each `<answer line>` is interpreted independently according to two
+conventions:
 
 | Form                          | Behaviour                                                                 |
 |-------------------------------|----------------------------------------------------------------------------|
-| Plain text/number             | Used verbatim (after `$`/`#` substitution). No calculation is performed.  |
-| Quoted: `"..."` or `'...'`    | Treated as a **literal** — the surrounding quotes are stripped and the inner text is inserted as-is, bypassing arithmetic evaluation entirely. Use this for non-numeric answers or text you don't want accidentally parsed as an expression. |
 | Leading `=`: `=<expression>`  | Everything after `=` is evaluated as a **numeric arithmetic expression** and the *calculated* result is inserted. |
+| Anything else                 | Used verbatim (after `$`/`#` substitution). No calculation is performed.  |
+
+A literal answer must not begin with `=`, since that would be interpreted as
+an expression to evaluate.
 
 Examples (after `$`/`#` substitution has already replaced `$E1`, `$E2` with
 numbers):
@@ -198,7 +224,7 @@ literal unit text `mV`.
 
 ```
 {{answer_2b}}
-"Depolarization"
+Depolarization
 ```
 → inserted literally as `Depolarization` — no substitution or calculation.
 
@@ -206,7 +232,7 @@ literal unit text `mV`.
 {{answer_1}}
 $T1
 ```
-→ no `=` and no quotes, so the already-substituted value of `$T1` is inserted
+→ no leading `=`, so the already-substituted value of `$T1` is inserted
 directly, unchanged.
 
 **Expression rules for `=` answers:**
@@ -220,8 +246,8 @@ directly, unchanged.
   trimmed (e.g. `12.340` → `12.34`).
 
 **Frame content rules:**
-- Exactly one placeholder-name line followed by exactly one answer line — more
-  or fewer lines raises an error at generation time.
+- Exactly one placeholder-name line (with an optional `; <points>` suffix) followed
+  by exactly one answer line — more or fewer lines raises an error at generation time.
 - Sub-part letters and numeric suffixes in the placeholder name (e.g.
   `{{answer_1a}}`) follow the same numbering rules as in the student template.
 

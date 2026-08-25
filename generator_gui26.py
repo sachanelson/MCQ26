@@ -1,11 +1,21 @@
 """
 MCQ Generator Application - Main GUI for generating questions and quizzes.
 """
+import warnings
+warnings.filterwarnings(
+    'ignore',
+    message='.*default style.*',
+    category=UserWarning,
+    module='openpyxl.*',
+)
 import sys
 import os
+import re
+import random
 import shutil
 import glob
-from typing import Dict, List
+import subprocess
+from typing import Dict, List, Optional, Tuple
 from PyQt6.QtWidgets import (
     QFileDialog, QLabel, QWidget
 )
@@ -34,19 +44,19 @@ from sqlalchemy.orm import Session
 from database26 import (
     Student, StudentModuleProgress, get_all_students, get_course_info,
     get_all_sections, get_students_for_section, get_all_students_as_dicts,
+    get_student_by_code, get_section, update_quiz_odt_values,
+    update_quiz_odt_info, get_student_module_question_ids, reset_quiz_data,
     NUM_MODULES,
 )
 from shared_gui26 import BaseMCQApp
 from course_info_panel26 import CourseInfoPanel
 from llm_converter26 import LLMConverter
 from quiz_generator26 import (
-    create_quizzes_for_students, get_quiz_page_count,
-    stamp_page_numbers_to_pdf, COURSE_FOLDER,
+    _find_start_attempt, create_quizzes_for_students, load_question_banks,
+    pdf_page_count, stamp_page_numbers_to_pdf,
 )
 from document_ids26 import artifact_id, format_quiz_id
-from OneUn import (ProblemDefinitionParser, ProblemGenerator, OneUnODTGenerator,
-                  load_problem_definition, generate_problems_for_student,
-                  get_odt_template_page_count)
+from OneUn import load_problem_definition, OneUnODTGenerator, ProblemDefinition
 
 
 
@@ -203,8 +213,16 @@ class MCQGeneratorGUI(BaseMCQApp):
         self.total_questions_input.setRange(1, 1000)
         self.total_questions_input.setValue(self.defaults['totalQuestions'])
         total_questions_layout.addWidget(self.total_questions_input)
+        
+        total_questions_layout.addSpacing(20)
+        total_questions_layout.addWidget(QLabel("Quizzes per student:"))
+        self.num_quizzes_input = QSpinBox()
+        self.num_quizzes_input.setRange(1, 10)
+        self.num_quizzes_input.setValue(1)
+        total_questions_layout.addWidget(self.num_quizzes_input)
+        
         total_questions_layout.addStretch()
-        form_layout.addRow("Total Questions:", total_questions_layout)
+        form_layout.addRow("Total MCQ Questions:", total_questions_layout)
 
         # Append One Unknown quiz option
         self.append_oneun_checkbox = QCheckBox("Append Quant ODT")
@@ -214,7 +232,28 @@ class MCQGeneratorGUI(BaseMCQApp):
             "using settings from the One Unknown tab."
         )
         form_layout.addRow("", self.append_oneun_checkbox)
-        
+
+        # Group packet option
+        self.create_packet_checkbox = QCheckBox("Create group packet PDF")
+        self.create_packet_checkbox.setChecked(False)
+        self.create_packet_checkbox.setToolTip(
+            "Merge all generated quiz PDFs into a single group packet, "
+            "sorted by student last name. Answer keys are not included."
+        )
+        form_layout.addRow("", self.create_packet_checkbox)
+
+        # Reset quiz data (testing)
+        reset_layout = QHBoxLayout()
+        reset_layout.addStretch()
+        self.reset_quiz_button = QPushButton("Reset Quiz Data")
+        self.reset_quiz_button.setToolTip(
+            "Drop all quiz attempts and quiz questions from the database "
+            "for testing.  Student and question-bank data are kept."
+        )
+        self.reset_quiz_button.clicked.connect(self._reset_quiz_data)
+        reset_layout.addWidget(self.reset_quiz_button)
+        form_layout.addRow("", reset_layout)
+
         layout.addWidget(form_group)
         
         # Student Codes are managed in the shared Student Codes tab
@@ -278,24 +317,14 @@ class MCQGeneratorGUI(BaseMCQApp):
         qbank_layout.addLayout(qbank_btn_layout)
         layout.addWidget(qbank_group)
         
-        # Create quizzes button with Dev Mode checkbox
-        quiz_btn_layout = QHBoxLayout()
-        
         # Create Quizzes button
+        quiz_btn_layout = QHBoxLayout()
+
         self.create_quiz_btn = QPushButton("Create Quizzes")
         self.create_quiz_btn.setStyleSheet("font-size: 14px; font-weight: bold; padding: 8px;")
         self.create_quiz_btn.clicked.connect(self.create_quiz_set_from_gui)
         quiz_btn_layout.addWidget(self.create_quiz_btn)
-        
-        # Add stretch to push the Dev Mode checkbox to the right
-        quiz_btn_layout.addStretch()
-        
-        # Dev Mode checkbox
-        self.dev_mode_checkbox = QCheckBox("Dev Mode")
-        self.dev_mode_checkbox.setChecked(False)  # Default to BE UNchecked
-        self.dev_mode_checkbox.setToolTip("When checked, quiz databases will not be updated")
-        quiz_btn_layout.addWidget(self.dev_mode_checkbox)
-        
+
         layout.addLayout(quiz_btn_layout)
 
         # Add Quiz Number entry and Delete Quizzes button
@@ -341,6 +370,26 @@ class MCQGeneratorGUI(BaseMCQApp):
         self.load_default_banks()        
         return tab
     
+    def _reset_quiz_data(self):
+        """Reset quiz data after confirmation."""
+        reply = QMessageBox.question(
+            self,
+            'Reset Quiz Data',
+            'This will delete all quiz attempts and quiz-question records, '
+            'but will keep students, question banks and course info.\n\n'
+            'Continue?',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            reset_quiz_data(self.engine)
+            QMessageBox.information(
+                self, 'Reset Complete', 'Quiz data has been reset.'
+            )
+        except Exception as e:
+            QMessageBox.warning(self, 'Reset Failed', f'Could not reset quiz data: {e}')
+
     def create_quiz_set_from_gui(self):
         """Create quizzes based on the current settings."""
         try:
@@ -385,37 +434,73 @@ class MCQGeneratorGUI(BaseMCQApp):
             # Module and date
             module_number = self.quiz_module_input.value()
             quiz_date = self.quiz_date_edit.date().toString("yyyy-MM-dd")
-            dev_mode = self.dev_mode_checkbox.isChecked()
 
-            created = create_quizzes_for_students(
-                engine=self.engine,
-                module_number=module_number,
-                student_codes=student_codes,
-                bank_paths=bank_paths,
-                questions_per_bank=questions_per_bank,
-                quiz_date=quiz_date,
-                attempts=None,  # Use course default max_attempts_per_module
-                dev_mode=dev_mode,
-            )
+            # Use the course folder from Course Info
+            course_folder = self.course_info_panel.course_folder_value.strip()
+            if not course_folder:
+                QMessageBox.warning(
+                    self,
+                    'Course Folder Missing',
+                    'Please set the Course Folder in the Course Info panel.'
+                )
+                return
+            if not os.path.isdir(course_folder):
+                QMessageBox.warning(
+                    self,
+                    'Course Folder Not Found',
+                    'The Course Folder does not exist: ' + course_folder
+                )
+                return
 
-            total_quizzes = sum(len(v) for v in created.values())
-            created_codes = ', '.join(sorted(created.keys()))
-            quiz_folder = os.path.join(COURSE_FOLDER, f'module{module_number}', 'quizzes')
+            attempts = self.num_quizzes_input.value()
 
-            # Optionally append Quant ODT, reusing the One Unknown tab settings
+            bank_questions = load_question_banks(bank_paths)
+
             if self.append_oneun_checkbox.isChecked():
-                self._append_oneun_to_quiz(
+                created = self._append_oneun_to_quiz(
                     module_number=module_number,
                     student_codes=student_codes,
                     total_mcq_questions=total_bank_questions,
-                    created=created,
+                    bank_paths=bank_paths,
+                    questions_per_bank=questions_per_bank,
+                    quiz_date=quiz_date,
+                    attempts=attempts,
+                    course_folder=course_folder,
+                    bank_questions=bank_questions,
                 )
             else:
+                created = create_quizzes_for_students(
+                    engine=self.engine,
+                    module_number=module_number,
+                    student_codes=student_codes,
+                    bank_paths=bank_paths,
+                    questions_per_bank=questions_per_bank,
+                    quiz_date=quiz_date,
+                    attempts=attempts,
+                    course_folder=course_folder,
+                    bank_questions=bank_questions,
+                )
+                quiz_folder = os.path.join(course_folder, f'module{module_number}', 'quizzes')
                 for code, quiz_ids in created.items():
                     for quiz_id in quiz_ids:
-                        quiz_pdf = os.path.join(quiz_folder, f'{artifact_id(quiz_id, "Q")}.pdf')
+                        attempt = int(quiz_id.split('_')[-1])
+                        quiz_pdf = os.path.join(quiz_folder, f'attempt{attempt}', 'questions', f'{artifact_id(quiz_id, "Q")}.pdf')
                         if os.path.exists(quiz_pdf):
                             stamp_page_numbers_to_pdf(quiz_pdf)
+
+            if self.create_packet_checkbox.isChecked():
+                try:
+                    packet_title = 'MCQ + Quant Quiz Packet' if self.append_oneun_checkbox.isChecked() else 'MCQ Quiz Packet'
+                    self._create_quiz_packets(
+                        created, module_number, course_folder, title=packet_title
+                    )
+                except Exception as pkt_err:
+                    print(f"[ERROR] Failed to create quiz packet: {pkt_err}")
+                    import traceback
+                    traceback.print_exc()
+
+            total_quizzes = sum(len(v) for v in created.values())
+            created_codes = ', '.join(sorted(created.keys()))
 
             QMessageBox.information(
                 self,
@@ -431,113 +516,560 @@ class MCQGeneratorGUI(BaseMCQApp):
 
     def _append_oneun_to_quiz(self, module_number: int, student_codes: List[str],
                               total_mcq_questions: int,
-                              created: Dict[str, List[str]]):
+                              bank_paths: List[str],
+                              questions_per_bank: Dict[str, int],
+                              quiz_date: str,
+                              attempts: Optional[int] = None,
+                              course_folder: str = '',
+                              bank_questions: Optional[Dict] = None):
         """Generate One Unknown ODTs appended to the MCQ PDFs.
 
-        Validates that the One Unknown tab's settings are compatible with the
-        current MCQ quiz, then generates ODTs whose question/page numbering
-        continues after the MCQ portion.
+        Selects a random starting template set and then proceeds through the
+        requested number of attempts, one per template set, wrapping cyclically.
         """
         params = self._oneun_get_params()
         if params is None:
             raise ValueError("One Unknown settings are incomplete; cannot append.")
 
-        (definition, mode, base_seed, metadata,
-         _output_path, template_path, answer_key_template_path, plot_config, def_path) = params
+        (definition_sets, base_seed, metadata, plot_config,
+         _module, _doc_type, _) = params
 
-        # Document type must be Quiz when appending to an MCQ quiz
-        if metadata.get('doc_type') != 'Quiz':
+        if _doc_type != 'Quiz':
             raise ValueError(
                 "One Unknown document type must be 'Quiz' when appending to an MCQ quiz."
             )
 
-        # Module must match the MCQ module (skip when no definition file is used)
-        if def_path:
-            oneun_module = self._extract_module_number(def_path)
-            if oneun_module is None:
-                raise ValueError(
-                    f"Cannot determine module from One Unknown definition filename: {def_path!r}. "
-                    "Use an M#_ prefix (e.g. M1_nernst.txt) to enable module matching."
-                )
-            if oneun_module != module_number:
-                raise ValueError(
-                    f"Module mismatch: MCQ module is {module_number}, "
-                    f"but One Unknown definition is for module {oneun_module}."
-                )
+        if attempts is None:
+            course_info = get_course_info(self.engine)
+            attempts = course_info.get('max_attempts_per_module', 4)
 
-        # Determine MCQ page count from the first generated metadata JSON
-        quiz_folder = os.path.join(
-            os.path.expanduser('~/textProcessing/NBIO140_2026'),
-            f'module{module_number}', 'quizzes')
-        mcq_pages = 0
+        num_sets = len(definition_sets)
+        start_set = random.randint(0, num_sets - 1) if num_sets > 1 else 0
+        odt_template_paths = [
+            os.path.basename(definition_sets[(start_set + a) % num_sets]['template_path'])
+            for a in range(attempts)
+        ]
+        odt_variable_names_list = [
+            sorted(definition_sets[(start_set + a) % num_sets]['definition'].variables.keys())
+            if definition_sets[(start_set + a) % num_sets]['definition']
+            and getattr(definition_sets[(start_set + a) % num_sets]['definition'], 'variables', None)
+            else []
+            for a in range(attempts)
+        ]
+
+        quiz_folder = os.path.join(course_folder, 'module' + str(module_number), 'quizzes')
+        odt_quiz_folder = os.path.join(course_folder, 'module' + str(module_number), 'templates', 'ODT_quizzes')
+        os.makedirs(odt_quiz_folder, exist_ok=True)
+
+        # -------------------------------------------------------------------
+        # 1. First student MCQ
+        # -------------------------------------------------------------------
         first_code = student_codes[0]
-        pattern = os.path.join(
-            quiz_folder, f"{first_code}_{module_number:02d}_0001QM.json")
-        matches = sorted(glob.glob(pattern))
-        if matches:
-            mcq_pages = get_quiz_page_count(matches[0])
-        else:
-            fallback = sorted(glob.glob(
-                os.path.join(quiz_folder, f"{first_code}_*QM.json")))
-            if fallback:
-                mcq_pages = get_quiz_page_count(fallback[0])
+        first_created = create_quizzes_for_students(
+            engine=self.engine,
+            module_number=module_number,
+            student_codes=[first_code],
+            bank_paths=bank_paths,
+            questions_per_bank=questions_per_bank,
+            quiz_date=quiz_date,
+            attempts=attempts,
+            course_folder=course_folder,
 
-        odt_pages = get_odt_template_page_count(template_path)
-        if odt_pages is None:
-            raise ValueError(f"Could not determine page count from ODT template {template_path!r}")
-        total_pages = mcq_pages + odt_pages
-        metadata['total_pages'] = total_pages
+            has_odt=True,
+            odt_template_paths=odt_template_paths,
+            odt_variable_names_list=odt_variable_names_list,
+            bank_questions=bank_questions,
+        )
+        if not first_created or first_code not in first_created or not first_created[first_code]:
+            raise ValueError('Failed to generate first MCQ.')
+        first_quiz_id = first_created[first_code][0]
+        first_attempt = int(first_quiz_id.split('_')[-1])
+        first_mcq_pdf = os.path.join(quiz_folder, f'attempt{first_attempt}', 'questions', artifact_id(first_quiz_id, 'Q') + '.pdf')
+        if not os.path.exists(first_mcq_pdf):
+            raise FileNotFoundError('First MCQ PDF not found: ' + first_mcq_pdf)
+        mcq_pages = pdf_page_count(first_mcq_pdf)
+        if mcq_pages == 0:
+            raise ValueError('First MCQ PDF has zero pages.')
 
-        # Output into the same module quizzes folder as the PDFs
-        out_stem = os.path.join(quiz_folder, 'oneunknown_quiz.odt')
-
+        # -------------------------------------------------------------------
+        # 2. Trial ODT to determine ODT page count
+        # -------------------------------------------------------------------
+        odt_out_stem = os.path.join(odt_quiz_folder, 'oneunknown_quiz.odt')
         odt_gen = OneUnODTGenerator()
-        generated_odts = odt_gen.generate_quiz(
-            definition=definition,
-            template_path=template_path,
-            output_path=out_stem,
-            student_codes=student_codes,
+
+        student_names: Dict[str, str] = {}
+        student_section_codes: Dict[str, str] = {}
+        for code in student_codes:
+            student = get_student_by_code(self.engine, code)
+            if student is not None:
+                student_names[code] = student.name or code
+                if student.section_number is not None:
+                    student_section_codes[code] = str(student.section_number)
+
+        metadata.setdefault('course', self.course_value)
+        metadata.setdefault('instructors', self.instructors_value)
+        metadata.setdefault('quiz_date', quiz_date)
+
+        trial_out = os.path.splitext(odt_out_stem)[0] + f'_A{first_attempt}.odt'
+        trial_main, trial_ak, _ = odt_gen.generate_quiz(
+            definition=definition_sets[start_set]['definition'],
+            template_path=definition_sets[start_set]['template_path'],
+            output_path=trial_out,
+            student_codes=[first_code],
             quiz_metadata=metadata,
-            mode=mode,
-            answer_key_template_path=answer_key_template_path or None,
+            answer_key_template_path=definition_sets[start_set]['answer_key_template_path'] or None,
+            student_names=student_names,
+            student_section_codes=student_section_codes,
             base_seed=base_seed,
             start_question=total_mcq_questions + 1,
             start_page=mcq_pages + 1,
+            attempts=1,
+            return_values=True,
         )
+        if not trial_main or not trial_main[0]:
+            raise ValueError('Trial ODT main not generated.')
+        trial_pdf = self._convert_odt_to_pdf(trial_main[0], odt_quiz_folder, insert_blank_pages=True)
+        odt_pages = pdf_page_count(trial_pdf)
+        if odt_pages == 0:
+            raise ValueError('Converted trial ODT has zero pages.')
 
-        # Stamp combined page numbers onto the existing MCQ PDFs
+        total_pages = odt_pages + mcq_pages
+        metadata['total_pages'] = total_pages
+
+        # -------------------------------------------------------------------
+        # 3. Final ODTs for all students and attempts
+        # -------------------------------------------------------------------
+        final_odt_files: List[str] = []
+        final_odt_values: Dict[str, List[Dict]] = {}
+        student_odt_template_paths: Dict[str, List[str]] = {code: [] for code in student_codes}
+        student_odt_variable_names: Dict[str, List[List[str]]] = {code: [] for code in student_codes}
+        odt_pdf_map: Dict[Tuple[str, int], str] = {}
+        odt_ak_pdf_map: Dict[Tuple[str, int], str] = {}
+
+        # Precompute a shuffled set order for each student so templates vary
+        # randomly within the session and pseudo-randomly across attempts.
+        student_set_indices: Dict[str, List[int]] = {}
+        for code in student_codes:
+            indices = list(range(num_sets))
+            random.shuffle(indices)
+            student_set_indices[code] = [indices[a % num_sets] for a in range(attempts)]
+
+        for a in range(attempts):
+            actual_attempt = first_attempt + a
+            attempt_out = os.path.splitext(odt_out_stem)[0] + f'_A{actual_attempt}.odt'
+            for i, code in enumerate(student_codes):
+                set_index = student_set_indices[code][a]
+                set_info = definition_sets[set_index]
+                attempt_base = (base_seed + i + a) if base_seed is not None else None
+                attempt_main, attempt_ak, attempt_values = odt_gen.generate_quiz(
+                    definition=set_info['definition'],
+                    template_path=set_info['template_path'],
+                    output_path=attempt_out,
+                    student_codes=[code],
+                    quiz_metadata=metadata,
+                    answer_key_template_path=set_info['answer_key_template_path'] or None,
+                    base_seed=attempt_base,
+                    student_names=student_names,
+                    student_section_codes=student_section_codes,
+                    start_question=total_mcq_questions + 1,
+                    start_page=mcq_pages + 1,
+                    attempts=1,
+                    return_values=True,
+                )
+                if attempt_main:
+                    final_odt_files.extend(attempt_main)
+                    pdf_path = self._convert_odt_to_pdf(attempt_main[0], odt_quiz_folder, insert_blank_pages=True)
+                    odt_pdf_map[(code, a + 1)] = pdf_path
+                if attempt_ak:
+                    final_odt_files.extend(attempt_ak)
+                    ak_pdf_path = self._convert_odt_to_pdf(attempt_ak[0], odt_quiz_folder, insert_blank_pages=False)
+                    odt_ak_pdf_map[(code, a + 1)] = ak_pdf_path
+                if code in attempt_values:
+                    final_odt_values.setdefault(code, []).append(attempt_values[code][0])
+                student_odt_template_paths[code].append(set_info['template_path'])
+                var_names = []
+                if set_info['definition'] and getattr(set_info['definition'], 'variables', None):
+                    var_names = sorted(set_info['definition'].variables.keys())
+                student_odt_variable_names[code].append(var_names)
+
+        # -------------------------------------------------------------------
+        # 4. Remaining MCQ PDFs for the other students
+        # -------------------------------------------------------------------
+        created = dict(first_created)
+        if len(student_codes) > 1:
+            rest_created = create_quizzes_for_students(
+                engine=self.engine,
+                module_number=module_number,
+                student_codes=student_codes[1:],
+                bank_paths=bank_paths,
+                questions_per_bank=questions_per_bank,
+                quiz_date=quiz_date,
+                attempts=attempts,
+                course_folder=course_folder,
+    
+                has_odt=True,
+                odt_template_paths=odt_template_paths,
+                odt_variable_names_list=odt_variable_names_list,
+                bank_questions=bank_questions,
+            )
+            created.update(rest_created)
+
+        # Update each generated Quiz row with the ODT values drawn for it.
+        for code, quiz_ids in created.items():
+            values_list = final_odt_values.get(code, [])
+            template_paths_list = student_odt_template_paths.get(code, [])
+            var_names_list = student_odt_variable_names.get(code, [])
+            for attempt_index, quiz_id in enumerate(quiz_ids, start=1):
+                idx = attempt_index - 1
+                odt_value = values_list[idx] if idx < len(values_list) else None
+                odt_template = template_paths_list[idx] if idx < len(template_paths_list) else None
+                odt_var_names = var_names_list[idx] if idx < len(var_names_list) else None
+                update_quiz_odt_info(self.engine, quiz_id, odt_template, odt_var_names, odt_value)
+
+        # -------------------------------------------------------------------
+        # 5. Append each ODT PDF to the corresponding MCQ PDF
+        # -------------------------------------------------------------------
+        for code, quiz_ids in created.items():
+            for attempt_index, quiz_id in enumerate(quiz_ids, start=1):
+                attempt = int(quiz_id.split('_')[-1])
+                quiz_pdf = os.path.join(quiz_folder, f'attempt{attempt}', 'questions', artifact_id(quiz_id, 'Q') + '.pdf')
+                if (code, attempt_index) in odt_pdf_map and os.path.exists(quiz_pdf):
+                    self._append_pdf_to_pdf(quiz_pdf, odt_pdf_map[(code, attempt_index)], quiz_pdf)
+
+                ak_pdf = os.path.join(quiz_folder, f'attempt{attempt}', 'answers', artifact_id(quiz_id, 'A') + '.pdf')
+                if (code, attempt_index) in odt_ak_pdf_map and os.path.exists(ak_pdf):
+                    self._append_pdf_to_pdf(ak_pdf, odt_ak_pdf_map[(code, attempt_index)], ak_pdf)
+
+        # -------------------------------------------------------------------
+        # 6. Stamp page numbers on the combined PDFs
+        # -------------------------------------------------------------------
         for code, quiz_ids in created.items():
             for quiz_id in quiz_ids:
-                quiz_pdf = os.path.join(quiz_folder, f'{artifact_id(quiz_id, "Q")}.pdf')
+                attempt = int(quiz_id.split('_')[-1])
+                quiz_pdf = os.path.join(quiz_folder, f'attempt{attempt}', 'questions', artifact_id(quiz_id, 'Q') + '.pdf')
                 if os.path.exists(quiz_pdf):
-                    stamp_page_numbers_to_pdf(quiz_pdf, total_pages=total_pages)
+                    stamp_page_numbers_to_pdf(quiz_pdf)
+                ak_pdf = os.path.join(quiz_folder, f'attempt{attempt}', 'answers', artifact_id(quiz_id, 'A') + '.pdf')
+                if os.path.exists(ak_pdf):
+                    stamp_page_numbers_to_pdf(ak_pdf)
 
-        # Write a summary log alongside the generated ODTs
+        # -------------------------------------------------------------------
+        # 6. Summary log
+        # -------------------------------------------------------------------
         odt_gen._write_summary_log(
-            log_path=os.path.splitext(out_stem)[0] + '_summary.txt',
-            definition_path=def_path,
-            template_path=template_path,
-            output_files=generated_odts,
+            log_path=os.path.join(odt_quiz_folder, 'oneunknown_quiz_summary.txt'),
+            definition_path=definition_sets[start_set]['def_path'],
+            template_path=definition_sets[start_set]['template_path'],
+            output_files=final_odt_files,
             student_seeds={
                 (sc or 'generic'): (base_seed + i if base_seed is not None else None)
                 for i, sc in enumerate(student_codes)
             },
             metadata=metadata,
-            mode=mode,
             plot_config=plot_config,
-            generated_at=__import__('datetime').datetime.now().isoformat(
-                timespec='seconds')
+            generated_at=datetime.now().isoformat(timespec='seconds')
         )
 
         QMessageBox.information(
             self,
-            "One Unknown Appended",
-            f"Generated {len(generated_odts)} One Unknown ODT file(s) "
-            f"appended to the MCQ quiz.\n"
-            f"Quant questions start at Q{total_mcq_questions + 1}, "
-            f"page {mcq_pages + 1}.\n"
-            f"Output folder: {quiz_folder}"
+            'One Unknown Appended',
+            'Generated ' + str(len(final_odt_files)) + ' One Unknown ODT file(s) appended to the MCQ quiz. '
+            'Quant questions start at Q' + str(total_mcq_questions + 1) + ', page ' + str(mcq_pages + 1) + '. '
+            'Combined total pages: ' + str(total_pages) + '. MCQs: ' + quiz_folder + ' ODTs: ' + odt_quiz_folder
         )
+
+        return created
+
+    def _convert_odt_to_pdf(self, odt_path: str, output_dir: str,
+                            insert_blank_pages: bool = False) -> str:
+        '''Convert an ODT file to PDF using LibreOffice headless.'''
+        office_bin = None
+        for name in ('soffice', 'libreoffice'):
+            office_bin = shutil.which(name)
+            if office_bin:
+                break
+        if not office_bin:
+            for path in (
+                '/Applications/LibreOffice.app/Contents/MacOS/soffice',
+                '/Applications/LibreOffice.app/Contents/MacOS/soffice.bin',
+            ):
+                if os.path.exists(path):
+                    office_bin = path
+                    break
+        if not office_bin:
+            raise FileNotFoundError(
+                'No ODT-to-PDF converter found. '
+                'Please install LibreOffice and ensure soffice is on PATH.'
+            )
+
+        base = os.path.splitext(os.path.basename(odt_path))[0]
+        expected_pdf = os.path.join(output_dir, base + '.pdf')
+        try:
+            subprocess.run(
+                [office_bin, '--headless', '--convert-to', 'pdf',
+                 '--outdir', output_dir, odt_path],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError('LibreOffice conversion failed for ' + odt_path + ': ' + str(e.stderr))
+
+        if not os.path.exists(expected_pdf):
+            candidates = [
+                f for f in os.listdir(output_dir)
+                if f.lower().endswith('.pdf') and f.startswith(base)
+            ]
+            if not candidates:
+                raise FileNotFoundError('PDF output not found for ' + odt_path)
+            expected_pdf = os.path.join(output_dir, sorted(candidates)[-1])
+
+        if insert_blank_pages:
+            from pypdf import PdfReader, PdfWriter
+            reader = PdfReader(expected_pdf)
+            writer = PdfWriter()
+            for page in reader.pages:
+                writer.add_page(page)
+                writer.add_blank_page(
+                    width=float(page.mediabox.width),
+                    height=float(page.mediabox.height)
+                )
+            tmp_pdf = expected_pdf + '.blanks.tmp'
+            with open(tmp_pdf, 'wb') as f:
+                writer.write(f)
+            os.replace(tmp_pdf, expected_pdf)
+
+        return expected_pdf
+
+    def _append_pdf_to_pdf(self, base_pdf_path: str, append_pdf_path: str, output_pdf_path: str):
+        '''Append append_pdf_path to base_pdf_path, writing to output_pdf_path.'''
+        from pypdf import PdfReader, PdfWriter
+        writer = PdfWriter()
+        tmp_path = output_pdf_path + '.tmp'
+        for path in (base_pdf_path, append_pdf_path):
+            reader = PdfReader(path)
+            for page in reader.pages:
+                writer.add_page(page)
+        with open(tmp_path, 'wb') as f:
+            writer.write(f)
+        os.replace(tmp_path, output_pdf_path)
+
+    def _student_sort_key(self, code: str):
+        """Return a sort key (last name, full name) for a student code."""
+        student = get_student_by_code(self.engine, code)
+        if student is None or not student.name:
+            return ('~', '')
+        parts = student.name.strip().split()
+        last = parts[-1].lower() if parts else ''
+        return (last, student.name.lower())
+
+    def _sort_codes_by_last_name(self, codes: List[str]) -> List[str]:
+        """Return student codes sorted by last name."""
+        return sorted(codes, key=self._student_sort_key)
+
+    def _merge_pdfs(self, pdf_paths: List[str], output_pdf_path: str,
+                    cover_pdf: Optional[str] = None):
+        '''Merge multiple PDFs into a single PDF, optionally prepending a coversheet.'''
+        from pypdf import PdfReader, PdfWriter
+        writer = PdfWriter()
+        paths = [cover_pdf] + pdf_paths if cover_pdf else pdf_paths
+        for path in paths:
+            reader = PdfReader(path)
+            for page in reader.pages:
+                writer.add_page(page)
+        os.makedirs(os.path.dirname(output_pdf_path), exist_ok=True)
+        tmp_path = output_pdf_path + '.tmp'
+        with open(tmp_path, 'wb') as f:
+            writer.write(f)
+        os.replace(tmp_path, output_pdf_path)
+
+    def _build_coversheet_pdf(self, title: str, student_codes: List[str],
+                              output_path: str, date_label: str = 'Date quizzes taken:'):
+        '''Generate a coversheet PDF with a date field and checkbox list of students.'''
+        from fpdf import FPDF
+        pdf = FPDF(orientation='P', unit='mm', format='Letter')  # matches physical printer paper
+        pdf.set_auto_page_break(auto=True, margin=25)
+        pdf.add_page()
+
+        pdf.set_font('Helvetica', 'B', 16)
+        pdf.cell(0, 10, title, ln=1, align='C')
+        pdf.ln(5)
+
+        pdf.set_font('Helvetica', '', 11)
+        pdf.cell(0, 8, f'{date_label} ____________________', ln=1)
+        pdf.ln(5)
+
+        pdf.set_font('Helvetica', 'B', 12)
+        pdf.cell(0, 8, 'Students (alphabetical):', ln=1)
+
+        pdf.set_font('Helvetica', '', 11)
+        line_h = 7
+        sorted_codes = self._sort_codes_by_last_name(student_codes)
+        for code in sorted_codes:
+            student = get_student_by_code(self.engine, code)
+            name = student.name if student and student.name else code
+            if pdf.get_y() + line_h + 5 > 297 - 25:
+                pdf.add_page()
+            start_x = pdf.get_x()
+            y = pdf.get_y()
+            box_size = 4
+            pdf.rect(start_x, y + 1.5, box_size, box_size)
+            pdf.set_xy(start_x + box_size + 3, y)
+            pdf.cell(0, line_h, name, ln=1)
+
+        pdf.ln(6)
+        pdf.cell(0, 6, 'Scanned by: _____________________________________', ln=1)
+
+        # Ensure the coversheet is an even number of sides so it forms one or
+        # more complete physical sheets separate from the following quizzes.
+        if pdf.page_no() % 2 != 0:
+            pdf.add_page()
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        pdf.output(output_path)
+
+    def _create_quiz_packets(self, created: Dict[str, List[str]], module_number: int,
+                             course_folder: str, title: str = 'Quiz Packet'):
+        '''Merge MCQ question PDFs for each attempt into a single group packet.'''
+        quiz_folder = os.path.join(course_folder, f'module{module_number}', 'quizzes')
+        attempts: Dict[int, List[Tuple[str, str]]] = {}
+        for code, quiz_ids in created.items():
+            for quiz_id in quiz_ids:
+                try:
+                    attempt = int(quiz_id.split('_')[-1])
+                except ValueError:
+                    continue
+                attempts.setdefault(attempt, []).append((code, quiz_id))
+
+        for attempt, code_quiz_ids in attempts.items():
+            sorted_items = sorted(code_quiz_ids, key=lambda item: self._student_sort_key(item[0]))
+            question_pdf_paths = []
+            answer_pdf_paths = []
+            for code, quiz_id in sorted_items:
+                question_pdf = os.path.join(
+                    quiz_folder, f'attempt{attempt}', 'questions',
+                    f"{artifact_id(quiz_id, 'Q')}.pdf"
+                )
+                answer_pdf = os.path.join(
+                    quiz_folder, f'attempt{attempt}', 'answers',
+                    f"{artifact_id(quiz_id, 'A')}.pdf"
+                )
+                if os.path.exists(question_pdf):
+                    question_pdf_paths.append(question_pdf)
+                if os.path.exists(answer_pdf):
+                    answer_pdf_paths.append(answer_pdf)
+            if not question_pdf_paths:
+                continue
+            group_name = artifact_id(format_quiz_id('Group', module_number, attempt), 'Q')
+            group_path = os.path.join(quiz_folder, f'attempt{attempt}', 'questions', f'{group_name}.pdf')
+            cover_path = os.path.join(quiz_folder, f'attempt{attempt}', 'questions', f'{group_name}_coversheet.pdf')
+            self._build_coversheet_pdf(
+                title,
+                [code for code, _ in sorted_items],
+                cover_path,
+            )
+            self._merge_pdfs(question_pdf_paths, group_path, cover_pdf=cover_path)
+
+            # Move component PDFs into subdirectories
+            individual_question_dir = os.path.join(quiz_folder, f'attempt{attempt}', 'questions', 'Individual')
+            individual_answer_dir = os.path.join(quiz_folder, f'attempt{attempt}', 'answers', 'Individual_answer')
+            os.makedirs(individual_question_dir, exist_ok=True)
+            os.makedirs(individual_answer_dir, exist_ok=True)
+            for src in question_pdf_paths:
+                shutil.move(src, os.path.join(individual_question_dir, os.path.basename(src)))
+            for src in answer_pdf_paths:
+                shutil.move(src, os.path.join(individual_answer_dir, os.path.basename(src)))
+
+            # Remove the temporary coversheet PDF
+            try:
+                os.remove(cover_path)
+            except Exception:
+                pass
+
+            print(f'[INFO] Created quiz packet: {group_path}')
+
+    def _create_quant_packets(self, main_files: List[str], answer_key_files: List[str],
+                              student_codes: List[str], module: int, output_dir: str,
+                              output_ids: Optional[Dict[str, str]] = None,
+                              answer_key_output_ids: Optional[Dict[str, str]] = None,
+                              title: str = 'Quant Packet',
+                              doc_type: str = 'Quiz'):
+        '''Convert generated Quant ODTs to PDFs and merge into group packets.'''
+        output_ids = output_ids or {}
+        answer_key_output_ids = answer_key_output_ids or {}
+
+        def _file_for_id(files: List[str], output_id: str):
+            target = f'{output_id}.odt'
+            for f in files:
+                if os.path.basename(f) == target:
+                    return f
+            return None
+
+        sorted_codes = self._sort_codes_by_last_name(student_codes)
+
+        # Subdirectories for component ODT files
+        main_odt_dir_name = 'worksheet_ODT' if doc_type == 'Worksheet' else 'quiz_ODT'
+        ak_odt_dir_name = 'worksheet_answers_ODT' if doc_type == 'Worksheet' else 'quiz_answers_odt'
+        main_odt_dir = os.path.join(output_dir, main_odt_dir_name)
+        ak_odt_dir = os.path.join(output_dir, ak_odt_dir_name)
+        os.makedirs(main_odt_dir, exist_ok=True)
+        os.makedirs(ak_odt_dir, exist_ok=True)
+
+        main_pdfs = []
+        main_odt_paths = []
+        for code in sorted_codes:
+            oid = output_ids.get(code, code)
+            odt = _file_for_id(main_files, oid)
+            if odt and os.path.exists(odt):
+                main_pdfs.append(self._convert_odt_to_pdf(odt, output_dir, insert_blank_pages=(doc_type == 'Quiz')))
+                main_odt_paths.append(odt)
+        if main_pdfs:
+            group_main_id = f"{format_quiz_id('Group', module, 1)}WS"
+            main_packet_path = os.path.join(output_dir, f'{group_main_id}.pdf')
+            main_cover_path = os.path.join(output_dir, f'{group_main_id}_coversheet.pdf')
+            self._build_coversheet_pdf(title, sorted_codes, main_cover_path)
+            self._merge_pdfs(main_pdfs, main_packet_path, cover_pdf=main_cover_path)
+
+            # Move main ODTs into subdirectory
+            for odt in main_odt_paths:
+                shutil.move(odt, os.path.join(main_odt_dir, os.path.basename(odt)))
+
+            # Delete component PDFs and coversheet
+            for pdf in main_pdfs + [main_cover_path]:
+                try:
+                    os.remove(pdf)
+                except Exception:
+                    pass
+
+            print(f'[INFO] Created quant packet: {main_packet_path}')
+
+        ak_pdfs = []
+        ak_odt_paths = []
+        if answer_key_files:
+            for code in sorted_codes:
+                oid = answer_key_output_ids.get(code, code)
+                odt = _file_for_id(answer_key_files, oid)
+                if odt and os.path.exists(odt):
+                    ak_pdfs.append(self._convert_odt_to_pdf(odt, output_dir, insert_blank_pages=False))
+                    ak_odt_paths.append(odt)
+            if ak_pdfs:
+                group_ak_id = f"{format_quiz_id('Group', module, 1)}WA"
+                ak_packet_path = os.path.join(output_dir, f'{group_ak_id}.pdf')
+                self._merge_pdfs(ak_pdfs, ak_packet_path)
+
+                # Move answer-key ODTs into subdirectory
+                for odt in ak_odt_paths:
+                    shutil.move(odt, os.path.join(ak_odt_dir, os.path.basename(odt)))
+
+                # Delete component answer-key PDFs
+                for pdf in ak_pdfs:
+                    try:
+                        os.remove(pdf)
+                    except Exception:
+                        pass
+
+                print(f'[INFO] Created quant answer-key packet: {ak_packet_path}')
 
     def _populate_section_filter_combo(self):
         """Populate the section filter combo from the database."""
@@ -741,19 +1273,17 @@ class MCQGeneratorGUI(BaseMCQApp):
         from PyQt6.QtWidgets import QMessageBox, QTableWidgetItem, QFileDialog
         import os
     
-        # Define the pattern for MX_YYYQD_datestr.txt
-        # M followed by 1-2 digits, underscore, 3 letters, Q/A/F/T, 0-2, underscore, date, .txt
-        pattern = r'^M\d{1,2}_[A-Za-z]{3}[QATF][0-2]_\w+\.txt$'
-        
+        # Define the pattern for integrated bank files: M#_TOPIC#_INT.txt
+        # M followed by 1-2 digits, underscore, topic letters, bank number, _INT.txt
+        pattern = r'^M\d{1,2}_[A-Za-z]+\d+_INT\.txt$'
+
         # Help text for error messages
         error_msg = (
-            "Selected file must match the pattern M#_XXXQ#_date.txt where:\n"
-            "- M# is the module number (1-2 digits)\n"
-            "- XXX is a 3-letter topic code\n"
-            "- Q is the file type (Q=question, A=answer, F=feedback, T=type)\n"
-            "- # is the difficulty (0-2)\n"
-            "- date is the date in format like May1525\n"
-            "Example: M1_ABCQ1_15May25.txt"
+            "Selected file must be an integrated question bank matching "
+            "M#_TOPIC#_INT.txt, for example:\n"
+            "- M4_CNS0_INT.txt\n"
+            "- M4_WHO0_INT.txt\n"
+            "These are the files produced by integrate_Qbanks.py."
         )
 
         # Get number of banks to load from spinner
@@ -1049,46 +1579,8 @@ class MCQGeneratorGUI(BaseMCQApp):
         scroll.setWidget(content)
         outer.addWidget(scroll)
 
-        # --- Input Files Group ---
-        files_group = QGroupBox("Input Files")
-        files_layout = QFormLayout()
-        files_group.setLayout(files_layout)
-
-        # Input folder that contains the .txt definition and .odt templates
-        folder_layout = QHBoxLayout()
-        self.oneun_input_folder = QLineEdit()
-        self.oneun_input_folder.setPlaceholderText("Select folder containing .txt, ODT template, and answer-key ODT")
-        self.oneun_input_folder.setMinimumWidth(380)
-        self.oneun_input_folder.editingFinished.connect(self._oneun_resolve_input_folder)
-        folder_layout.addWidget(self.oneun_input_folder)
-        self.oneun_browse_folder_btn = QPushButton("Browse…")
-        self.oneun_browse_folder_btn.clicked.connect(self._oneun_browse_input_folder)
-        folder_layout.addWidget(self.oneun_browse_folder_btn)
-        files_layout.addRow("Input Folder:", folder_layout)
-
-        # Auto-detected definition file (.txt)
-        self.oneun_def_path = QLineEdit()
-        self.oneun_def_path.setReadOnly(True)
-        self.oneun_def_path.setPlaceholderText("Auto-detected .txt file")
-        self.oneun_def_path.setMinimumWidth(380)
-        self.oneun_def_path.textChanged.connect(self._oneun_def_loaded)
-        files_layout.addRow("Definition File:", self.oneun_def_path)
-
-        # Auto-detected ODT template file (required)
-        self.oneun_tpl_path = QLineEdit()
-        self.oneun_tpl_path.setReadOnly(True)
-        self.oneun_tpl_path.setPlaceholderText("Auto-detected ODT template")
-        self.oneun_tpl_path.setMinimumWidth(380)
-        files_layout.addRow("ODT Template (required):", self.oneun_tpl_path)
-
-        # Auto-detected answer key template file (optional)
-        self.oneun_answer_key_tpl_path = QLineEdit()
-        self.oneun_answer_key_tpl_path.setReadOnly(True)
-        self.oneun_answer_key_tpl_path.setPlaceholderText("Auto-detected answer-key ODT (optional)")
-        self.oneun_answer_key_tpl_path.setMinimumWidth(380)
-        files_layout.addRow("Answer Key ODT:", self.oneun_answer_key_tpl_path)
-
-        layout.addWidget(files_group)
+        # Storage for matched template sets
+        self.oneun_definition_sets = []
 
         # --- Generation Parameters Group ---
         params_group = QGroupBox("Generation Parameters")
@@ -1112,23 +1604,11 @@ class MCQGeneratorGUI(BaseMCQApp):
         self.oneun_module_num.addItem("None selected")
         for i in range(1, NUM_MODULES + 1):
             self.oneun_module_num.addItem(str(i))
-        self.oneun_module_num.currentIndexChanged.connect(self._oneun_update_output_preview)
+        self.oneun_module_num.currentIndexChanged.connect(
+            lambda index: self._oneun_update_input_folder())
         module_layout.addWidget(self.oneun_module_num)
         module_layout.addStretch()
         params_layout.addRow("Module:", module_layout)
-
-        mode_layout = QHBoxLayout()
-        self.oneun_mode_random = QRadioButton("Random")
-        self.oneun_mode_pseudo_random = QRadioButton("Pseudo Random")
-        self.oneun_mode_random.setChecked(True)
-        self.oneun_mode_random.setToolTip("Values chosen randomly from allowed values")
-        self.oneun_mode_pseudo_random.setToolTip(
-            "Value combinations chosen in random order without reuse across students"
-        )
-        mode_layout.addWidget(self.oneun_mode_random)
-        mode_layout.addWidget(self.oneun_mode_pseudo_random)
-        mode_layout.addStretch()
-        params_layout.addRow("Mode:", mode_layout)
 
         seed_layout = QHBoxLayout()
         self.oneun_use_seed = QCheckBox("Use base seed:")
@@ -1141,6 +1621,15 @@ class MCQGeneratorGUI(BaseMCQApp):
         seed_layout.addWidget(self.oneun_seed)
         seed_layout.addStretch()
         params_layout.addRow("Reproducibility:", seed_layout)
+
+        # Group packet option
+        self.oneun_packet_checkbox = QCheckBox("Create group packet PDF")
+        self.oneun_packet_checkbox.setChecked(False)
+        self.oneun_packet_checkbox.setToolTip(
+            "Convert generated ODTs to PDFs and merge into group packets, "
+            "sorted by student last name. Answer keys are produced as a separate packet."
+        )
+        params_layout.addRow("", self.oneun_packet_checkbox)
 
         layout.addWidget(params_group)
 
@@ -1195,26 +1684,27 @@ class MCQGeneratorGUI(BaseMCQApp):
         oneun_sc_note.setStyleSheet("color: #666; font-style: italic;")
         layout.addWidget(oneun_sc_note)
 
-        # --- Output Group ---
-        output_group = QGroupBox("Output")
-        output_layout = QFormLayout()
-        output_group.setLayout(output_layout)
+        # --- Input Files Group ---
+        files_group = QGroupBox("Input Files")
+        files_layout = QFormLayout()
+        files_group.setLayout(files_layout)
 
-        out_file_layout = QHBoxLayout()
-        self.oneun_output_path = QLineEdit()
-        self.oneun_output_path.setPlaceholderText("Optional base file name; auto-filled if blank")
-        self.oneun_output_path.setMinimumWidth(380)
-        out_file_layout.addWidget(self.oneun_output_path)
-        self.oneun_output_browse_btn = QPushButton("Browse…")
-        self.oneun_output_browse_btn.clicked.connect(self._oneun_browse_output)
-        out_file_layout.addWidget(self.oneun_output_browse_btn)
-        output_layout.addRow("Output File (optional):", out_file_layout)
+        # Auto-set, read-only input folder
+        self.oneun_input_folder = QLineEdit()
+        self.oneun_input_folder.setPlaceholderText("Select a module and document type")
+        self.oneun_input_folder.setReadOnly(True)
+        self.oneun_input_folder.setMinimumWidth(380)
+        files_layout.addRow("Input Folder:", self.oneun_input_folder)
 
-        self.oneun_output_preview = QLabel("Select a module to see output folder")
-        self.oneun_output_preview.setStyleSheet("color: #666;")
-        output_layout.addRow("Output Folder:", self.oneun_output_preview)
+        # Matched definition set names
+        self.oneun_def_path = QLineEdit()
+        self.oneun_def_path.setReadOnly(True)
+        self.oneun_def_path.setPlaceholderText("No matching template sets found")
+        self.oneun_def_path.setMinimumWidth(380)
+        self.oneun_def_path.textChanged.connect(self._oneun_def_loaded)
+        files_layout.addRow("Definition Files:", self.oneun_def_path)
 
-        layout.addWidget(output_group)
+        layout.addWidget(files_group)
 
         # --- Generate button — lower right ---
         layout.addStretch()
@@ -1228,37 +1718,40 @@ class MCQGeneratorGUI(BaseMCQApp):
         gen_btn_row.addWidget(self.oneun_generate_btn)
         layout.addLayout(gen_btn_row)
 
+        self._oneun_update_input_folder()
         return tab
 
     def _oneun_update_generate_btn(self):
         """Update the generate button label to match the selected document type."""
         doc_type = 'Worksheet' if self.oneun_type_worksheet.isChecked() else 'Quiz'
         self.oneun_generate_btn.setText(f"Generate {doc_type}")
-        self._oneun_update_output_preview()
+        self._oneun_update_input_folder()
 
-    def _oneun_update_output_preview(self):
-        """Display the auto-computed output folder for the selected module/doc type."""
-        module_text = self.oneun_module_num.currentText()
-        if module_text == "None selected":
-            self.oneun_output_preview.setText("Select a module to see output folder")
-            return
-        try:
-            module = int(module_text)
-        except ValueError:
-            self.oneun_output_preview.setText("Invalid module selection")
-            return
-        subdir = 'worksheets' if self.oneun_type_worksheet.isChecked() else 'quizzes'
-        try:
-            course_info = get_course_info(self.engine)
-            course_folder = (course_info.get('course_folder') or '').strip()
-        except Exception:
-            course_folder = ''
-        if not course_folder:
-            self.oneun_output_preview.setText("Configure Course Folder in Course Info first")
-            return
-        folder = os.path.join(os.path.expanduser(course_folder),
-                              f"module{module}", subdir)
-        self.oneun_output_preview.setText(folder)
+    def _oneun_update_input_folder(self, folder=None):
+        """Set the standardized input folder and reload template sets."""
+        if folder is None:
+            module_text = self.oneun_module_num.currentText()
+            if module_text == "None selected":
+                self.oneun_input_folder.setText("Select a module to see input folder")
+                return
+            try:
+                module = int(module_text)
+            except ValueError:
+                self.oneun_input_folder.setText("Invalid module selection")
+                return
+            subdir = 'worksheet_templates' if self.oneun_type_worksheet.isChecked() else 'quiz_templates'
+            try:
+                course_info = get_course_info(self.engine)
+                course_folder = (course_info.get('course_folder') or '').strip()
+            except Exception:
+                course_folder = ''
+            if not course_folder:
+                self.oneun_input_folder.setText("Configure Course Folder in Course Info first")
+                return
+            folder = os.path.join(os.path.expanduser(course_folder),
+                                  f"module{module}", subdir)
+            self.oneun_input_folder.setText(folder)
+        self._oneun_resolve_input_folder(folder)
 
     def _oneun_toggle_plot_controls(self, enabled: bool):
         """Enable/disable plot control widgets based on the include-graph checkbox."""
@@ -1267,15 +1760,22 @@ class MCQGeneratorGUI(BaseMCQApp):
                   self.oneun_log_x, self.oneun_log_y):
             w.setEnabled(enabled)
 
+    def _oneun_first_def_path(self) -> str:
+        """Return the .txt path of the first matched template set, if any."""
+        sets = getattr(self, 'oneun_definition_sets', None)
+        if sets:
+            return sets[0].get('def_path', '')
+        return ''
+
     def _oneun_def_loaded(self):
-        """Called when the definition file path changes; repopulate variable combos."""
-        path = self.oneun_def_path.text().strip()
+        """Called when the definition file list changes; repopulate variable combos."""
+        path = self._oneun_first_def_path()
         if path and os.path.exists(path):
             self._oneun_eq_changed(self.oneun_eq_spinbox.value())
 
     def _oneun_eq_changed(self, eq_num: int):
         """Reparse the variables for equation eq_num and populate X/Y combos."""
-        path = self.oneun_def_path.text().strip()
+        path = self._oneun_first_def_path()
         if not path or not os.path.exists(path):
             return
         try:
@@ -1313,93 +1813,135 @@ class MCQGeneratorGUI(BaseMCQApp):
                 if idx >= 0:
                     combo.setCurrentIndex(idx)
 
-    def _oneun_browse_input_folder(self):
-        """Browse for a folder containing the definition .txt and ODT templates."""
-        folder = QFileDialog.getExistingDirectory(
-            self, "Select Input Folder",
-            os.path.expanduser('~'))
-        if folder:
-            self.oneun_input_folder.setText(folder)
-            self._oneun_resolve_input_folder(folder)
-
     def _oneun_resolve_input_folder(self, folder=None):
-        """Auto-detect definition .txt, main .odt template, and optional answer-key .odt."""
+        """Load matched template sets (Name_Template.odt, Name_AnswerTemplate.odt, optional Name.txt)."""
         if folder is None:
             folder = self.oneun_input_folder.text().strip()
-        if not folder or not os.path.isdir(folder):
+        if not folder:
             return
-        try:
-            files = os.listdir(folder)
-        except OSError:
+        if not os.path.isdir(folder):
+            print(f"[ERROR] OneUn input folder does not exist: {folder}")
+            QMessageBox.warning(self, 'Input Folder Not Found',
+                                f'Input folder does not exist: {folder}')
+            self.oneun_definition_sets = []
+            self.oneun_def_path.setText('')
             return
-        txt_files = [f for f in files if f.lower().endswith('.txt') and 'summary' not in f.lower()]
-        odt_files = [f for f in files if f.lower().endswith('.odt')]
-        if not txt_files:
-            print("[ERROR] No .txt definition file found in the selected folder.")
-            return
-        if len(txt_files) > 1:
-            print("[ERROR] Multiple .txt files found; the folder should contain exactly one definition file.")
-            return
-        if not odt_files:
-            print("[ERROR] No .odt template files found in the selected folder.")
-            return
-        answer_odts = [f for f in odt_files if 'answer' in f.lower() or 'key' in f.lower()]
-        non_answer_odts = [f for f in odt_files if f not in answer_odts]
-        if len(non_answer_odts) == 1 and len(answer_odts) == 1:
-            main_template = non_answer_odts[0]
-            answer_key_template = answer_odts[0]
-        elif len(non_answer_odts) == 1 and not answer_odts:
-            main_template = non_answer_odts[0]
-            answer_key_template = ''
-        else:
-            print("[ERROR] Cannot determine the ODT template and answer-key template. "
-                  "Expected one main .odt and optionally one whose name contains 'answer' or 'key'.")
-            return
-        self.oneun_def_path.setText(os.path.join(folder, txt_files[0]))
-        self.oneun_tpl_path.setText(os.path.join(folder, main_template))
-        self.oneun_answer_key_tpl_path.setText(
-            os.path.join(folder, answer_key_template) if answer_key_template else '')
 
-    def _oneun_browse_output(self):
-        """Browse for output ODT file location."""
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save Quiz As",
-            os.path.expanduser('~/oneun_quiz.odt'),
-            "ODT Files (*.odt);;All Files (*)")
-        if path:
-            self.oneun_output_path.setText(path)
+        try:
+            files = [f for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f))]
+        except OSError as e:
+            print(f"[ERROR] Cannot read input folder {folder}: {e}")
+            self.oneun_definition_sets = []
+            self.oneun_def_path.setText('')
+            return
+
+        template_re = re.compile(r'^(.*?)__?Template\.odt$', re.IGNORECASE)
+        answer_re = re.compile(r'^(.*?)__?AnswerTemplate\.odt$', re.IGNORECASE)
+        txt_re = re.compile(r'^(.*?)\.txt$', re.IGNORECASE)
+
+        templates: Dict[str, str] = {}
+        answers: Dict[str, str] = {}
+        txts: Dict[str, str] = {}
+        for f in files:
+            m = template_re.match(f)
+            if m:
+                templates[m.group(1)] = f
+                continue
+            m = answer_re.match(f)
+            if m:
+                answers[m.group(1)] = f
+                continue
+            m = txt_re.match(f)
+            if m:
+                txts[m.group(1)] = f
+
+        candidate_names = set(templates) | set(answers) | set(txts)
+        matched_names = set(templates) & set(answers)
+
+        if not matched_names:
+            err = (f"No complete template sets found in {folder}. "
+                   "Each set needs Name_Template.odt and Name_AnswerTemplate.odt; Name.txt is optional.")
+            print(f"[ERROR] {err}")
+            QMessageBox.warning(self, 'No Template Sets', err)
+            self.oneun_definition_sets = []
+            self.oneun_def_path.setText('')
+            return
+
+        for name in sorted(candidate_names - matched_names):
+            if name in matched_names:
+                continue
+            missing = []
+            if name not in templates:
+                missing.append('Name_Template.odt')
+            if name not in answers:
+                missing.append('Name_AnswerTemplate.odt')
+            have = []
+            if name in templates:
+                have.append('Name_Template.odt')
+            if name in answers:
+                have.append('Name_AnswerTemplate.odt')
+            if name in txts:
+                have.append('Name.txt')
+            warn = (f"Template set '{name}' is incomplete (missing {', '.join(missing)}; "
+                    f"has {', '.join(have)}). It will be ignored.")
+            print(f"[WARNING] {warn}")
+
+        if self.oneun_type_worksheet.isChecked() and len(matched_names) > 1:
+            chosen = sorted(matched_names)[0]
+            warn = (f"{len(matched_names)} template sets found for worksheets; "
+                    f"only the first ({chosen}) will be used. Place unused sets in a subfolder.")
+            print(f"[WARNING] {warn}")
+            QMessageBox.warning(self, 'Multiple Template Sets', warn)
+
+        self.oneun_definition_sets = []
+        for name in sorted(matched_names):
+            self.oneun_definition_sets.append({
+                'name': name,
+                'template_path': os.path.join(folder, templates[name]),
+                'answer_key_template_path': os.path.join(folder, answers[name]),
+                'def_path': os.path.join(folder, txts[name]) if name in txts else None,
+            })
+
+        display_names = []
+        for name in sorted(matched_names):
+            suffix = ' (+txt)' if name in txts else ' (no txt)'
+            display_names.append(name + suffix)
+        self.oneun_def_path.setText('; '.join(display_names))
+        self._oneun_def_loaded()
 
     def _oneun_get_params(self):
         """Gather all OneUn parameters from the UI.
 
         Returns:
-            Tuple of (definition, mode, base_seed, metadata,
-                      output_path, template_path, plot_config, def_path)
+            Tuple of (definition_sets, base_seed, metadata, plot_config,
+                      module_number, doc_type, course_folder)
             or None if validation fails.  Errors are printed to terminal.
         """
-        # Definition file is optional (template can have no variables/constants)
-        def_path = self.oneun_def_path.text().strip()
-        if def_path and not os.path.exists(def_path):
-            print("[ERROR] Problem definition file not found.")
+        if not getattr(self, 'oneun_definition_sets', []):
+            print("[ERROR] No template sets loaded. Select a module and document type.")
+            QMessageBox.warning(self, 'No Template Sets',
+                                'No template sets loaded. Check the input folder.')
             return None
 
-        definition = None
-        if def_path:
-            try:
-                definition = load_problem_definition(def_path)
-            except Exception as e:
-                print(f"[ERROR] Problem definition has errors: {e}")
-                import traceback
-                traceback.print_exc()
-                return None
-
-        # Validate template (required)
-        template_path = self.oneun_tpl_path.text().strip()
-        if not template_path or not os.path.exists(template_path):
-            print("[ERROR] Please select a valid ODT template file.")
+        module_text = self.oneun_module_num.currentText()
+        if module_text == "None selected":
+            print("[ERROR] Please select a module number.")
+            return None
+        try:
+            module = int(module_text)
+        except ValueError:
+            print("[ERROR] Invalid module number selected.")
             return None
 
-        mode = 'pseudo_random' if self.oneun_mode_pseudo_random.isChecked() else 'random'
+        try:
+            course_info = get_course_info(self.engine)
+            course_folder = (course_info.get('course_folder') or '').strip()
+        except Exception:
+            course_folder = ''
+        if not course_folder:
+            print("[ERROR] No course folder configured. Set it in Course Info.")
+            return None
+
         base_seed = self.oneun_seed.value() if self.oneun_use_seed.isChecked() else None
 
         doc_type = 'Worksheet' if self.oneun_type_worksheet.isChecked() else 'Quiz'
@@ -1418,40 +1960,6 @@ class MCQGeneratorGUI(BaseMCQApp):
             'quiz_date': self.quiz_date_edit.date().toString("yyyy-MM-dd"),
         }
 
-        output_path = self.oneun_output_path.text().strip()
-        if not output_path:
-            module_text = self.oneun_module_num.currentText()
-            if module_text == "None selected":
-                print("[ERROR] Please select a module number or enter an output file path.")
-                return None
-            try:
-                module = int(module_text)
-            except ValueError:
-                print("[ERROR] Invalid module number selected.")
-                return None
-            try:
-                course_info = get_course_info(self.engine)
-                course_folder = (course_info.get('course_folder') or '').strip()
-            except Exception:
-                course_folder = ''
-            if not course_folder:
-                print("[ERROR] No course folder configured. Set it in Course Info.")
-                return None
-            subdir = 'worksheets' if self.oneun_type_worksheet.isChecked() else 'quizzes'
-            doc_type = 'Worksheet' if self.oneun_type_worksheet.isChecked() else 'Quiz'
-            date_str = datetime.now().strftime('%b%d%y')
-            output_path = os.path.join(
-                os.path.expanduser(course_folder),
-                f'module{module}',
-                subdir,
-                f'OneUn_{doc_type}_{date_str}.odt'
-            )
-
-        answer_key_template_path = self.oneun_answer_key_tpl_path.text().strip()
-        if answer_key_template_path and not os.path.exists(answer_key_template_path):
-            print("[ERROR] Please select a valid answer-key ODT template.")
-            return None
-
         plot_config = {
             'include_graph': self.oneun_include_graph.isChecked(),
             'equation_index': self.oneun_eq_spinbox.value(),
@@ -1462,17 +1970,39 @@ class MCQGeneratorGUI(BaseMCQApp):
             'log_y': self.oneun_log_y.isChecked(),
         }
 
-        return (definition, mode, base_seed, metadata,
-                output_path, template_path, answer_key_template_path, plot_config, def_path)
+        definition_sets = []
+        for s in self.oneun_definition_sets:
+            if s['def_path']:
+                try:
+                    definition = load_problem_definition(s['def_path'])
+                except Exception as e:
+                    print(f"[ERROR] Could not load definition {s['def_path']}: {e}")
+                    QMessageBox.warning(self, 'Definition Error',
+                                        f"Could not load {s['def_path']}: {e}")
+                    return None
+            else:
+                definition = ProblemDefinition(equations=[], variables={}, constants={})
+            definition_sets.append({
+                'name': s['name'],
+                'definition': definition,
+                'template_path': s['template_path'],
+                'answer_key_template_path': s['answer_key_template_path'],
+                'def_path': s['def_path'],
+            })
+
+        return (definition_sets, base_seed, metadata, plot_config,
+                module, doc_type, course_folder)
 
     def _oneun_generate(self):
-        """Generate one ODT quiz per student code."""
+        """Generate ODT file(s) for the selected student codes."""
         params = self._oneun_get_params()
         if params is None:
             return
 
-        (definition, mode, base_seed, metadata,
-         output_path, template_path, answer_key_template_path, plot_config, def_path) = params
+        (definition_sets, base_seed, metadata, plot_config,
+         module, doc_type, course_folder) = params
+
+        set_info = definition_sets[0]
 
         # Parse student codes
         raw_codes = self.student_codes_text.toPlainText().strip()
@@ -1483,68 +2013,89 @@ class MCQGeneratorGUI(BaseMCQApp):
         # Build module-based worksheet IDs when a module is selected
         output_ids: dict = {}
         answer_key_output_ids: dict = {}
-        module_text = self.oneun_module_num.currentText()
-        if module_text != "None selected":
-            module = int(module_text)
+        if module is not None:
             for code in student_codes:
                 base = format_quiz_id(code, module, 1)
                 output_ids[code] = f"{base}WS"
                 answer_key_output_ids[code] = f"{base}WA"
 
-        # Resolve student codes to real names for the ODT header
+        # Resolve student codes to real names/section numbers for the ODT header
         student_names: dict = {}
+        student_section_codes: dict = {}
         try:
             for row in get_all_students_as_dicts(self.engine):
                 if row.get('student_code') in student_codes:
-                    student_names[row['student_code']] = row.get('name') or row['student_code']
+                    code = row['student_code']
+                    student_names[code] = row.get('name') or code
+                    section_number = row.get('section_number')
+                    student_section_codes[code] = str(section_number) if section_number is not None else ''
         except Exception as e:
             print(f"Warning: could not load student names: {e}")
 
-        base_dir = os.path.dirname(os.path.abspath(output_path))
+        subdir = 'worksheets' if doc_type == 'Worksheet' else 'quizzes'
+        output_dir = os.path.join(course_folder, f'module{module}', subdir)
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, set_info['name'] + '.odt')
 
         try:
             odt_gen = OneUnODTGenerator()
-            generated = odt_gen.generate_quiz(
-                definition=definition,
-                template_path=template_path,
+            main_files, answer_key_files, _ = odt_gen.generate_quiz(
+                definition=set_info['definition'],
+                template_path=set_info['template_path'],
                 output_path=output_path,
                 student_codes=student_codes,
                 quiz_metadata=metadata,
                 plot_config=plot_config,
-                mode=mode,
                 output_ids=output_ids or None,
-                answer_key_template_path=answer_key_template_path or None,
+                answer_key_template_path=set_info['answer_key_template_path'] or None,
                 answer_key_output_ids=answer_key_output_ids or None,
                 student_names=student_names or None,
-                base_seed=base_seed
+                student_section_codes=student_section_codes or None,
+                base_seed=base_seed,
+                return_values=True,
             )
-            # Pass definition path into the summary log retroactively
+            generated = main_files + answer_key_files
+            log_path = os.path.join(output_dir, set_info['name'] + '_summary.txt')
             odt_gen._write_summary_log(
-                log_path=os.path.splitext(output_path)[0] + '_summary.txt',
-                definition_path=def_path,
-                template_path=template_path,
+                log_path=log_path,
+                definition_path=set_info['def_path'],
+                template_path=set_info['template_path'],
                 output_files=generated,
                 student_seeds={
                     (sc or 'generic'): (base_seed + i if base_seed is not None else None)
                     for i, sc in enumerate(student_codes)
                 },
                 metadata=metadata,
-                mode=mode,
                 plot_config=plot_config,
-                generated_at=__import__('datetime').datetime.now().isoformat(
-                    timespec='seconds')
+                generated_at=datetime.now().isoformat(timespec='seconds')
             )
+
+            if self.oneun_packet_checkbox.isChecked():
+                try:
+                    packet_title = 'Worksheet Packet' if doc_type == 'Worksheet' else 'Quant Quiz Packet'
+                    self._create_quant_packets(
+                        main_files, answer_key_files, student_codes, module, output_dir,
+                        output_ids=output_ids,
+                        answer_key_output_ids=answer_key_output_ids,
+                        title=packet_title,
+                        doc_type=doc_type,
+                    )
+                except Exception as pkt_err:
+                    print(f"[ERROR] Failed to create quant packet: {pkt_err}")
+                    import traceback
+                    traceback.print_exc()
 
             QMessageBox.information(
                 self, "Success",
-                f"Generated {len(generated)} quiz file(s).\n\n"
-                f"Equations (questions): {len(definition.equations)}\n"
+                f"Generated {len(generated)} {doc_type.lower()} file(s).\n\n"
+                f"Set: {set_info['name']}\n"
+                f"Equations (questions): {len(set_info['definition'].equations)}\n"
                 f"Students: {len(student_codes)}\n"
-                f"Mode: {mode}\n"
-                f"Output folder: {base_dir}\n\n"
+                f"Base seed: {base_seed}\n"
+                f"Output folder: {output_dir}\n\n"
                 f"Summary log written alongside output files.")
             self.statusBar().showMessage(
-                f"OneUn: {len(generated)} quiz(zes) saved", 5000)
+                f"OneUn: {len(generated)} {doc_type.lower()}(s) saved", 5000)
 
         except Exception as e:
             print(f"\n[ERROR] OneUn generation failed: {e}")

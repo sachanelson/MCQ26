@@ -13,6 +13,9 @@ odfpy
 opencv-python
 scikit-image
 Pillow
+pytesseract
+# Also requires the tesseract OCR binary itself (not a Python package),
+# e.g. `brew install tesseract` on macOS.
 # Numeric / scientific
 numpy
 scipy

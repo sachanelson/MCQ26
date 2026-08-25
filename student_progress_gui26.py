@@ -12,9 +12,9 @@ from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QLineEdit, QPushButton, QTabWidget, QComboBox, QTableWidget,
+    QLabel, QPushButton, QTabWidget, QComboBox, QTableWidget,
     QTableWidgetItem, QHeaderView, QMessageBox, QGroupBox, QFormLayout,
-    QSpinBox, QCheckBox, QDateEdit, QDialog, QDialogButtonBox
+    QCheckBox, QDialog,
 )
 from PyQt6.QtCore import Qt, QDate
 from PyQt6.QtGui import QColor
@@ -25,7 +25,7 @@ from database26 import (
     get_all_students, get_modules, get_course_info,
     get_all_student_progress, get_all_quizzes,
     update_progress_completed, increment_attempts_count,
-    record_quiz_attempt, delete_quiz_attempt,
+    delete_quiz_attempt,
 )
 from shared_gui26 import BaseMCQApp
 from regrade_dialog26 import RegradeDialog
@@ -288,10 +288,6 @@ class StudentProgressGUI(BaseMCQApp):
         refresh_btn.clicked.connect(self._refresh_quizzes)
         filter_layout.addWidget(refresh_btn)
 
-        add_btn = QPushButton("Add Quiz Attempt")
-        add_btn.clicked.connect(self._add_quiz_dialog)
-        filter_layout.addWidget(add_btn)
-
         delete_btn = QPushButton("Delete Selected")
         delete_btn.clicked.connect(self._delete_selected_quiz)
         filter_layout.addWidget(delete_btn)
@@ -304,9 +300,9 @@ class StudentProgressGUI(BaseMCQApp):
 
         # Quiz table
         self.quizzes_table = QTableWidget()
-        self.quizzes_table.setColumnCount(5)
+        self.quizzes_table.setColumnCount(6)
         self.quizzes_table.setHorizontalHeaderLabels(
-            ["Student", "Module", "Quiz ID", "Date", "Score"]
+            ["Student", "Module", "Quiz ID", "Date", "Score", "Corrected"]
         )
         self.quizzes_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.quizzes_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -344,6 +340,7 @@ class StudentProgressGUI(BaseMCQApp):
                 'quiz_id': q.quiz_id,
                 'date': q.date_taken,
                 'score': q.score if q.score is not None else '',
+                'corrected': q.date_score_corrected or '' if q.score_corrected else '',
             })
 
         self.quizzes_table.setRowCount(len(rows))
@@ -353,66 +350,8 @@ class StudentProgressGUI(BaseMCQApp):
             self.quizzes_table.setItem(row, 2, QTableWidgetItem(r['quiz_id']))
             self.quizzes_table.setItem(row, 3, QTableWidgetItem(r['date']))
             self.quizzes_table.setItem(row, 4, QTableWidgetItem(str(r['score'])))
+            self.quizzes_table.setItem(row, 5, QTableWidgetItem(r['corrected']))
             self.quizzes_table.item(row, 0).setData(Qt.ItemDataRole.UserRole, r['id'])
-
-    def _add_quiz_dialog(self):
-        """Open a dialog to add a new quiz attempt."""
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Add Quiz Attempt")
-        layout = QFormLayout()
-        dialog.setLayout(layout)
-
-        student_combo = QComboBox()
-        for student in get_all_students(self.engine):
-            student_combo.addItem(_format_student(student), student.student_id)
-        layout.addRow("Student:", student_combo)
-
-        module_spin = QSpinBox()
-        module_spin.setRange(1, 99)
-        module_spin.setValue(1)
-        layout.addRow("Module:", module_spin)
-
-        quiz_id_edit = QLineEdit()
-        quiz_id_edit.setPlaceholderText("e.g. quiz_001")
-        layout.addRow("Quiz ID:", quiz_id_edit)
-
-        date_edit = QDateEdit()
-        date_edit.setCalendarPopup(True)
-        date_edit.setDate(QDate.currentDate())
-        layout.addRow("Date:", date_edit)
-
-        score_spin = QSpinBox()
-        score_spin.setRange(0, 100)
-        score_spin.setSpecialValueText("Ungraded")
-        score_spin.setValue(0)
-        layout.addRow("Score (0-100):", score_spin)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addRow(buttons)
-
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-
-        student_id = student_combo.currentData()
-        module_number = module_spin.value()
-        quiz_id = quiz_id_edit.text().strip() or "manual"
-        date_taken = date_edit.date().toString("yyyy-MM-dd")
-        score = score_spin.value() if score_spin.value() > 0 else None
-
-        record_quiz_attempt(
-            self.engine,
-            student_id=student_id,
-            module_number=module_number,
-            quiz_id=quiz_id,
-            date_taken=date_taken,
-            score=score,
-        )
-        self._refresh_quizzes()
-        self._refresh_progress()
 
     def _regrade_selected_quiz(self):
         """Open the manual regrade dialog for the selected quiz attempt."""

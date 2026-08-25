@@ -26,15 +26,12 @@ from fpdf import FPDF
 from pypdf import PdfReader, PdfWriter
 
 from database26 import (
-    Student, Quiz, get_course_info, get_student_by_code,
+    Student, Quiz, get_course_info, get_student_by_code, get_section,
     add_generated_quiz_attempt, get_student_module_question_ids, quiz_attempt_exists,
 )
 from document_ids26 import artifact_id, format_quiz_id
 from quiz_bank_parser26 import load_question_banks
 from qr_code26 import generate_qr_code
-
-
-COURSE_FOLDER = os.path.expanduser('~/textProcessing/NBIO140_2026')
 
 
 # ---------------------------------------------------------------------------
@@ -119,8 +116,13 @@ class QuizPDF(FPDF):
             self.set_draw_color(0)
             self.circle(x, y, self.circle_radius, 'D')
 
-    def __init__(self, course=None, instructors=None, student=None, date=None, quiz_id=None, quiz_type=None, module_num=None):
-        super().__init__(orientation='P', unit='mm', format='A4')
+    def __init__(self, course=None, instructors=None, student=None, date=None, quiz_id=None, quiz_type=None, module_num=None, section_code=''):
+        # Letter, not A4: quizzes are printed on US Letter paper in practice.
+        # Authoring at A4 and printing on Letter causes most print drivers to
+        # silently "shrink to fit + center" the content (different aspect
+        # ratios), which shifts every recorded coordinate in the calibration
+        # metadata relative to what's actually on the physical/scanned page.
+        super().__init__(orientation='P', unit='mm', format='Letter')
         self.unifontsubset = False
         self.set_auto_page_break(auto=True, margin=15)
         self.course = course
@@ -130,13 +132,14 @@ class QuizPDF(FPDF):
         self.quiz_id = quiz_id
         self.quiz_type = quiz_type
         self.module_num = module_num
+        self.section_code = section_code
         self.circle_radius = 2.16
         self.set_title('Multiple Choice Quiz')
         self.first_page = True
         self.metadata = {
             "quiz_id": quiz_id,
             "module_num": module_num,
-            "page_dimensions": {"width": 210, "height": 297}
+            "page_dimensions": {"width": self.w, "height": self.h}
         }
         self._last_page = False
         self.add_page()
@@ -193,14 +196,20 @@ class QuizPDF(FPDF):
             student_name = self.student
             if hasattr(self.student, 'name'):
                 student_name = self.student.name
-            header_str = (
-                f"Course: {self.course}    Instructors: {instructors_clean}    "
-                f"Student: {student_name}    Date: {self.quiz_date}"
+            section_part = f"Section: {self.section_code} ________" if self.section_code else "Section: ________"
+            self.multi_cell(
+                0, 8,
+                f"Course: {self.course}    Instructor: {instructors_clean}    Student: {student_name}",
+                align='L', ln=1
             )
-            self.multi_cell(0, 8, header_str, align='L')
+            self.multi_cell(
+                0, 8,
+                f"{section_part}    Created: {self.quiz_date}",
+                align='L', ln=1
+            )
             self.ln(4)
             if quiz_type != 'Extra Page':
-                self.cell(0, 8, 'Signature: _______________________________', align='L')
+                self.cell(0, 8, 'Signature: _______________________________    Date: ______________________________', ln=1)
                 self.ln(2)
         else:
             if getattr(self, 'quiz_id', None):
@@ -244,7 +253,12 @@ class QuizPDF(FPDF):
         """Add one question to the PDF."""
         try:
             if stem:
-                stem = sanitize_text_for_pdf(stem)
+                stem = sanitize_text_for_pdf(stem).lstrip(': ').strip()
+            if not stem:
+                stem = ''
+            # If the stem contains only the question id, replace it with a placeholder
+            if stem and question_id is not None and stem == question_id:
+                stem = f'[Question text missing; ID: {question_id}]'
             sanitized_answers = [sanitize_text_for_pdf(ans) if ans else ans for ans in answers]
             if len(sanitized_answers) == len(answers):
                 answers = sanitized_answers
@@ -339,40 +353,100 @@ class QuizPDF(FPDF):
 # Quiz creation API
 # ---------------------------------------------------------------------------
 
-def _module_quiz_folder(module_number: int) -> str:
+def _module_quiz_folder(module_number: int, course_folder: str) -> str:
     """Return and create the module quizzes folder."""
-    folder = os.path.join(COURSE_FOLDER, f'module{module_number}', 'quizzes')
+    folder = os.path.join(course_folder, f'module{module_number}', 'quizzes')
     os.makedirs(folder, exist_ok=True)
     return folder
+
+
+def _module_answer_key_folder(module_number: int, course_folder: str) -> str:
+    """Return and create the module answer keys folder."""
+    folder = os.path.join(course_folder, f'module{module_number}', 'answer_keys')
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def _find_start_attempt(
+    engine,
+    student_id: int,
+    student_code: str,
+    module_number: int,
+    needed: int,
+) -> int:
+    """Return the first attempt number for which `needed` consecutive attempts are free."""
+    attempt = 1
+    while True:
+        if all(
+            not quiz_attempt_exists(
+                engine, student_id, module_number,
+                format_quiz_id(student_code, module_number, attempt + i)
+            )
+            for i in range(needed)
+        ):
+            return attempt
+        attempt += 1
 
 
 def _select_questions(
     bank_questions: Dict[str, List[Dict]],
     questions_per_bank: Dict[str, int],
     excluded_ids: Optional[set] = None,
-) -> List[Dict]:
-    """Select random questions from each bank, respecting overlap rules."""
+) -> Tuple[List[Dict], int]:
+    """Select questions from each bank, preferring not-yet-used ones.
+
+    The selection is database-driven: `excluded_ids` contains the question IDs
+    already assigned to this student in this module.  If a bank has been
+    exhausted, the remaining required questions are drawn from the full bank,
+    allowing reuse.  The number of questions that were already in
+    `excluded_ids` is returned so the caller can report how many were reused.
+    """
     if excluded_ids is None:
         excluded_ids = set()
 
+    initial_excluded = set(excluded_ids)
     selected: List[Dict] = []
+    reused_count = 0
+
     for bank_path, questions in bank_questions.items():
         n = questions_per_bank.get(bank_path, 0)
         if n <= 0:
             continue
-        available = [q for q in questions if q['id'] not in excluded_ids]
-        if len(available) < n:
+        if n > len(questions):
             raise ValueError(
-                f"Bank {os.path.basename(bank_path)} has only {len(available)} "
-                f"usable questions, requested {n}"
+                f"Bank {os.path.basename(bank_path)} requested {n} questions "
+                f"but only has {len(questions)}"
             )
-        chosen = random.sample(available, n)
+
+        not_used = [q for q in questions if q['id'] not in excluded_ids]
+        chosen: List[Dict] = []
+
+        if len(not_used) >= n:
+            chosen = random.sample(not_used, n)
+        else:
+            # Use all not-yet-used questions, then top up from the rest of the bank.
+            random.shuffle(not_used)
+            chosen = not_used[:]
+            chosen_ids = {q['id'] for q in chosen}
+            while len(chosen) < n:
+                remaining = [q for q in questions if q['id'] not in chosen_ids]
+                if not remaining:
+                    break
+                random.shuffle(remaining)
+                q = remaining[0]
+                chosen.append(q)
+                chosen_ids.add(q['id'])
+
         for q in chosen:
+            if q['id'] in initial_excluded:
+                reused_count += 1
+            excluded_ids.add(q['id'])
             for oid in q.get('overlap', []):
                 excluded_ids.add(oid)
         selected.extend(chosen)
+
     random.shuffle(selected)
-    return selected
+    return selected, reused_count
 
 
 def _prepare_quiz_questions(selected: List[Dict]) -> List[Dict]:
@@ -400,7 +474,7 @@ def _prepare_quiz_questions(selected: List[Dict]) -> List[Dict]:
 
 def create_quiz_pdf(questions, output_file, is_answer_key=False, course=None, instructors=None,
                     student=None, quiz_date=None, base_quiz_id=None, module_num=None,
-                    ensure_even_pages=True):
+                    ensure_even_pages=True, section_code=''):
     """Create a quiz PDF (or answer-key PDF) from prepared questions."""
     instructors_str = instructors
     if isinstance(instructors, list):
@@ -411,7 +485,7 @@ def create_quiz_pdf(questions, output_file, is_answer_key=False, course=None, in
         student_name = student.name
 
     quiz_type = 'Answer Key' if is_answer_key else 'Quiz'
-    pdf = QuizPDF(course, instructors_str, student_name, quiz_date, base_quiz_id, quiz_type, module_num)
+    pdf = QuizPDF(course, instructors_str, student_name, quiz_date, base_quiz_id, quiz_type, module_num, section_code)
     pdf.metadata.update({
         'course': course,
         'instructors': instructors_str,
@@ -455,10 +529,15 @@ def create_quiz_pdf(questions, output_file, is_answer_key=False, course=None, in
     pdf.output(output_file)
 
     output_dir = os.path.dirname(output_file)
+    if is_answer_key:
+        metadata_dir = output_dir
+    else:
+        metadata_dir = os.path.normpath(os.path.join(output_dir, os.pardir, 'JSON'))
+    os.makedirs(metadata_dir, exist_ok=True)
     letter = 'A' if is_answer_key else 'Q'
     basename = os.path.basename(output_file)
     basename_no_ext = os.path.splitext(basename)[0]
-    metadata_path = os.path.join(output_dir, f"{basename_no_ext}M.json")
+    metadata_path = os.path.join(metadata_dir, f"{basename_no_ext}M.json")
     for page_num, page_data in pdf.metadata.items():
         if isinstance(page_num, str) and page_num.isdigit():
             page_data["page_number"] = int(page_num)
@@ -478,24 +557,15 @@ def create_quizzes_for_students(
     bank_paths: List[str],
     questions_per_bank: Dict[str, int],
     quiz_date: str,
+    course_folder: str,
     attempts: Optional[int] = None,
-    dev_mode: bool = False,
+    has_odt: bool = False,
+    odt_template_paths: Optional[List[str]] = None,
+    odt_variable_names_list: Optional[List[List[str]]] = None,
+    odt_values: Optional[Dict[str, List[Dict]]] = None,
+    bank_questions: Optional[Dict[str, List[Dict]]] = None,
 ) -> Dict[str, List[str]]:
-    """Create PDF quizzes for selected students in the module's quizzes folder.
-
-    Args:
-        engine: SQLAlchemy engine
-        module_number: module number (1-based)
-        student_codes: list of student codes
-        bank_paths: list of integrated question bank paths
-        questions_per_bank: dict mapping bank path -> number of questions to select
-        quiz_date: date string for quiz files
-        attempts: number of quizzes per student (defaults to course max_attempts_per_module)
-        dev_mode: if True, do not write database records
-
-    Returns:
-        Dict mapping student code -> list of created quiz IDs.
-    """
+    """Create PDF quizzes for selected students in the module's quizzes folder."""
     if not bank_paths:
         raise ValueError("At least one question bank is required")
 
@@ -506,7 +576,8 @@ def create_quizzes_for_students(
     course = course_info.get('course', 'NBIO 140b')
     instructors = course_info.get('instructors', 'Sacha Nelson and Christine Grienberger')
 
-    bank_questions = load_question_banks(bank_paths)
+    if bank_questions is None:
+        bank_questions = load_question_banks(bank_paths)
     for bank_path, questions in bank_questions.items():
         if not questions:
             raise ValueError(f"No usable questions in bank: {bank_path}")
@@ -516,8 +587,12 @@ def create_quizzes_for_students(
                 f"Bank {os.path.basename(bank_path)} requested {n} questions but only has {len(questions)}"
             )
 
-    quiz_folder = _module_quiz_folder(module_number)
+    quiz_folder = _module_quiz_folder(module_number, course_folder)
     created: Dict[str, List[str]] = {}
+    first_bank_path = next(iter(bank_questions)) if bank_questions else ''
+    first_bank_name = os.path.basename(first_bank_path) if first_bank_path else ''
+    first_bank_size = len(bank_questions[first_bank_path]) if first_bank_path in bank_questions else 0
+    first_bank_n = questions_per_bank.get(first_bank_path, 0)
 
     for code in student_codes:
         code = code.strip()
@@ -529,23 +604,41 @@ def create_quizzes_for_students(
             print(f"[WARNING] Student code not found: {code}")
             continue
 
+        excluded_ids = get_student_module_question_ids(
+            engine, student.student_id, module_number
+        )
+
         created[code] = []
-        for attempt in range(1, attempts + 1):
+        student_odt_values = (odt_values or {}).get(code, []) if has_odt else []
+        start_attempt = _find_start_attempt(
+            engine, student.student_id, student.student_code, module_number, attempts
+        )
+
+        for attempt in range(start_attempt, start_attempt + attempts):
             quiz_id = format_quiz_id(student.student_code, module_number, attempt)
-            if not dev_mode and quiz_attempt_exists(
-                engine, student.student_id, module_number, quiz_id
-            ):
-                raise ValueError(f'Quiz {quiz_id} already exists and will not be regenerated')
-            excluded_ids = get_student_module_question_ids(
-                engine, student.student_id, module_number
-            )
-            selected = _select_questions(
-                bank_questions, questions_per_bank, excluded_ids=excluded_ids
+            selected, reused = _select_questions(
+                bank_questions,
+                questions_per_bank,
+                excluded_ids=excluded_ids,
             )
             quiz_questions = _prepare_quiz_questions(selected)
 
-            quiz_pdf_path = os.path.join(quiz_folder, f"{artifact_id(quiz_id, 'Q')}.pdf")
-            key_pdf_path = os.path.join(quiz_folder, f"{artifact_id(quiz_id, 'A')}.pdf")
+            section_code = ''
+            if student.section_number is not None:
+                sec = get_section(engine, student.section_number)
+                if sec:
+                    section_code = sec.get('code', '')
+
+            attempt_folder = os.path.join(quiz_folder, f'attempt{attempt}')
+            attempt_quiz_folder = os.path.join(attempt_folder, 'questions')
+            attempt_key_folder = os.path.join(attempt_folder, 'answers')
+            attempt_json_folder = os.path.join(attempt_folder, 'JSON')
+            os.makedirs(attempt_quiz_folder, exist_ok=True)
+            os.makedirs(attempt_key_folder, exist_ok=True)
+            os.makedirs(attempt_json_folder, exist_ok=True)
+
+            quiz_pdf_path = os.path.join(attempt_quiz_folder, f"{artifact_id(quiz_id, 'Q')}.pdf")
+            key_pdf_path = os.path.join(attempt_key_folder, f"{artifact_id(quiz_id, 'A')}.pdf")
 
             create_quiz_pdf(
                 quiz_questions,
@@ -558,6 +651,7 @@ def create_quizzes_for_students(
                 base_quiz_id=quiz_id,
                 module_num=module_number,
                 ensure_even_pages=True,
+                section_code=section_code,
             )
             create_quiz_pdf(
                 quiz_questions,
@@ -570,18 +664,41 @@ def create_quizzes_for_students(
                 base_quiz_id=quiz_id,
                 module_num=module_number,
                 ensure_even_pages=True,
+                section_code=section_code,
             )
 
             created[code].append(quiz_id)
 
-            if not dev_mode:
-                add_generated_quiz_attempt(
-                    engine=engine,
-                    student_id=student.student_id,
-                    module_number=module_number,
-                    quiz_id=quiz_id,
-                    date_taken=quiz_date,
-                    questions=quiz_questions,
+            odt_index = attempt - start_attempt
+            odt_value_for_attempt = (
+                student_odt_values[odt_index]
+                if odt_index < len(student_odt_values)
+                else None
+            )
+            odt_template_path_for_attempt = ''
+            if has_odt and odt_template_paths and odt_index < len(odt_template_paths):
+                odt_template_path_for_attempt = odt_template_paths[odt_index]
+            odt_variable_names_for_attempt = None
+            if has_odt and odt_variable_names_list and odt_index < len(odt_variable_names_list):
+                odt_variable_names_for_attempt = odt_variable_names_list[odt_index]
+            add_generated_quiz_attempt(
+                engine=engine,
+                student_id=student.student_id,
+                module_number=module_number,
+                quiz_id=quiz_id,
+                date_taken=quiz_date,
+                questions=quiz_questions,
+                has_odt=has_odt,
+                odt_template_path=odt_template_path_for_attempt,
+                odt_variable_names=odt_variable_names_for_attempt,
+                odt_variable_values=odt_value_for_attempt,
+            )
+
+            if reused > 0:
+                print(
+                    f"[WARNING] {reused} question(s) reused for quiz {attempt} of module {module_number} "
+                    f"for student {code} (qbank {first_bank_name} has only {first_bank_size} "
+                    f"questions but {first_bank_n} are needed per quiz for {attempts} quizzes)"
                 )
 
     return created
@@ -618,11 +735,20 @@ def stamp_page_numbers_to_pdf(pdf_path: str, total_pages: Optional[int] = None) 
         total_pages = n
     labels = [f'{i}:{total_pages}' for i in range(1, n + 1)]
 
-    overlay = FPDF(orientation='P', unit='mm', format='A4')
+    # Match the overlay's page size to the actual PDF being stamped (points -> mm),
+    # rather than assuming a fixed paper size, so the stamp lands in the right place
+    # regardless of what format the source PDF was authored in.
+    mediabox = reader.pages[0].mediabox
+    pt_to_mm = 25.4 / 72.0
+    page_width_mm = float(mediabox.width) * pt_to_mm
+    page_height_mm = float(mediabox.height) * pt_to_mm
+
+    overlay = FPDF(orientation='P', unit='mm', format=(page_width_mm, page_height_mm))
+    overlay.set_auto_page_break(False)
     for label in labels:
         overlay.add_page()
         overlay.set_font('Helvetica', '', 10)
-        overlay.set_y(-15)
+        overlay.set_y(overlay.h - 15)
         overlay.cell(0, 10, label, align='C')
     overlay_bytes = bytes(overlay.output())
     overlay_reader = PdfReader(io.BytesIO(overlay_bytes))
@@ -639,9 +765,9 @@ def stamp_page_numbers_to_pdf(pdf_path: str, total_pages: Optional[int] = None) 
     return total_pages
 
 
-def list_module_quizzes(module_number: int) -> List[str]:
+def list_module_quizzes(module_number: int, course_folder: str) -> List[str]:
     """Return a list of quiz PDF paths for a module."""
-    quiz_folder = _module_quiz_folder(module_number)
+    quiz_folder = _module_quiz_folder(module_number, course_folder)
     return sorted(
         os.path.join(quiz_folder, f)
         for f in os.listdir(quiz_folder)

@@ -76,7 +76,7 @@ import os
 import re
 import random
 import itertools
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 from dataclasses import dataclass
 from pathlib import Path
 from copy import deepcopy
@@ -580,43 +580,34 @@ class ProblemGenerator:
         self._pseudo_random_pools[1] = combos
         self._pseudo_random_indices[1] = 0
 
-    def generate_for_student(self, mode: str = 'random',
-                             seed: Optional[int] = None) -> List[Problem]:
+    def generate_for_student(self, seed: Optional[int] = None) -> List[Problem]:
         """Generate one Problem for a single student, with a value for every
         variable in the definition.
 
+        Values are drawn from a shuffled pool of all allowed value combinations
+        so that, within the same ProblemGenerator, no combination is reused until
+        the pool is exhausted.  A separate ProblemGenerator is created for each
+        student, so values are independent (effectively random) across students.
+
         Args:
-            mode: 'random' — values chosen randomly from allowed values.
-                  'pseudo_random' — values chosen in random order from the
-                  complete set of allowed value combinations without reuse.
-            seed: Random seed.  The caller is responsible for tracking seeds.
+            seed: Random seed used to shuffle the pool on first call.
 
         Returns:
             A single-element list containing the generated Problem.
         """
-        # Pseudo random pools are built once (with the first seed) and then
-        # consumed across all students so that no combination is reused.
-        if mode == 'pseudo_random':
-            if not self._pseudo_random_initialized:
-                if seed is not None:
-                    random.seed(seed)
-                self._build_pseudo_random_pools()
-                self._pseudo_random_initialized = True
-        elif seed is not None:
-            random.seed(seed)
+        if not self._pseudo_random_initialized:
+            if seed is not None:
+                random.seed(seed)
+            self._build_pseudo_random_pools()
+            self._pseudo_random_initialized = True
 
-        if mode == 'pseudo_random':
-            pool = self._pseudo_random_pools[1]
-            index = self._pseudo_random_indices[1]
-            if index >= len(pool):
-                raise ValueError(f'Ran out of unique OneUn value combinations ({len(pool)} available)')
-            given_values = dict(pool[index])
-            self._pseudo_random_indices[1] += 1
-        else:
-            given_values = {
-                var_name: random.choice(variable.get_allowed_values())
-                for var_name, variable in self.definition.variables.items()
-            }
+        pool = self._pseudo_random_pools[1]
+        index = self._pseudo_random_indices[1]
+        if index >= len(pool):
+            # Exhausted the pool: wrap around and allow repetition.
+            index = index % len(pool)
+        given_values = dict(pool[index])
+        self._pseudo_random_indices[1] = index + 1
         return [Problem(given_values=given_values, equation_index=1)]
 
 
@@ -776,8 +767,9 @@ class PlotGenerator:
 # Template Processor
 # ---------------------------------------------------------------------------
 
-# Regex for placeholder names: {{answer}}, {{answer_1}}, {{graph}}, {{graph_2}}
-_PLACEHOLDER_RE = re.compile(r'\{\{(answer|graph)(?:_(\d+[A-Za-z]*))?\}\}', re.IGNORECASE)
+# Regex for placeholder names: {{answer}}, {{answer_1}}, {{answer_1a; 2}}, {{graph}}, {{graph_2}}
+# Optional semicolon and trailing content (e.g. point value) is captured but ignored.
+_PLACEHOLDER_RE = re.compile(r'\{\{(answer|graph)(?:_(\d+[A-Za-z]*))?(?:\s*;\s*([^}]+))?\}\}', re.IGNORECASE)
 
 
 class TemplateProcessor:
@@ -809,6 +801,7 @@ class TemplateProcessor:
                 metadata: Optional[Dict] = None,
                 student_code: str = '',
                 student_name: str = '',
+                section_code: str = '',
                 answer_key: bool = False) -> str:
         """Process a template ODT, substituting variables and placeholders.
 
@@ -865,11 +858,21 @@ class TemplateProcessor:
             # Inject programmatic header/footer if metadata supplied
             if metadata:
                 self._ensure_header_styles(root, styles_tree)
-                self._inject_header(root, ns, metadata, student_code, student_name)
+                self._inject_header(root, ns, metadata, student_code, student_name, section_code)
+                self._ensure_header(styles_tree, section_code, student_name, metadata)
                 self._ensure_footer(styles_tree, metadata=metadata)
+                self._reduce_page_margins_for_signature(styles_tree)
                 if styles_tree is not None:
                     styles_tree.write(styles_xml, xml_declaration=True,
                                       encoding='UTF-8', pretty_print=False)
+
+            # Blank pages for ODT quizzes are now inserted at PDF-conversion time
+            # (see generator_gui26._convert_odt_to_pdf), so no ODT-level blank
+            # page injection is performed here.
+
+            # Some tokens are split across inline text spans in the ODT XML.
+            # Join them so the later per-node substitutions see whole tokens.
+            self._normalize_token_spans(root, definition, ns)
 
             # Replace #Constant tokens in body text and tables
             self._substitute_constants(root, definition)
@@ -947,11 +950,16 @@ class TemplateProcessor:
          {},
          {'font-family': 'Helvetica', 'font-size': '8pt', 'font-weight': 'normal'}),
         ('OneUnHeader', 'paragraph',
-         {'margin-top': '0.05in', 'margin-bottom': '0.3in', 'line-height': '100%'},
+         {'text-align': 'right', 'margin-top': '0.05in',
+          'margin-bottom': '0.1in', 'line-height': '100%'},
          {'font-family': 'Helvetica', 'font-size': '11pt'}),
         ('OneUnSignature', 'paragraph',
-         {'margin-top': '0.1in', 'margin-bottom': '0.4in'},
+         {'margin-top': '0in', 'margin-bottom': '0.4in'},
          {'font-family': 'Helvetica', 'font-size': '11pt'}),
+        ('OneUnExtraPage', 'paragraph',
+         {'break-before': 'page', 'margin-top': '0in',
+          'margin-bottom': '0in', 'line-height': '100%'},
+         {}),
     ]
 
     def _ensure_header_styles(self, content_root, styles_tree) -> None:
@@ -1001,7 +1009,8 @@ class TemplateProcessor:
                         tp.set(f'{{{ns_fo}}}{k}', v)
 
     def _inject_header(self, root, ns: Dict, metadata: Dict,
-                       student_code: str, student_name: str = '') -> None:
+                       student_code: str, student_name: str = '',
+                       section_code: str = '') -> None:
         """Prepend title / info / signature paragraphs to the document body.
 
         Matches the layout of ODTQuizGenerator._add_header exactly:
@@ -1050,32 +1059,11 @@ class TemplateProcessor:
             el.text = text
             return el
 
-        # --- Title paragraph ---
-        title_p = _p('OneUnTitle')
-        title_p.text = doc_type
-        if student_code:
-            title_p.append(_span('OneUnQuizIDSpan', '   ' + student_code))
-        if start_question is not None and start_page is not None:
-            title_p.append(_span('OneUnQuizIDSpan',
-                                 f'   (Q{start_question}+, p.{start_page}+)'))
-        text_el.insert(0, title_p)
-
-        # --- Header info line ---
-        header_str = (
-            f"Course:\xa0{_nbsp(course)}, "
-            f"Instructor:\xa0{_nbsp(instructors)}, "
-            f"Student:\xa0{_nbsp(display_name)}, "
-            f"created:\xa0{quiz_date}"
-        )
-        header_p = _p('OneUnHeader')
-        header_p.text = header_str
-        text_el.insert(1, header_p)
-
         # --- Signature line ---
         sig_p = _p('OneUnSignature')
         sig_p.text = ('Signature: _______________________________'
                       '          Date: _______________________________')
-        text_el.insert(2, sig_p)
+        text_el.insert(0, sig_p)
 
     def _ensure_footer(self, styles_tree, metadata=None) -> None:
         """Add a centered page-number footer to the first master page."""
@@ -1117,21 +1105,157 @@ class TemplateProcessor:
         p = etree.SubElement(footer, f'{{{ns_text}}}p')
         p.set(f'{{{ns_text}}}style-name', 'OneUnFooter')
 
-        start_page = metadata.get('start_page') if metadata else None
-        total_pages = metadata.get('total_pages') if metadata else None
+    def _ensure_header(self, styles_tree, section_code: str,
+                       student_name: str, metadata: Dict) -> None:
+        """Add a right-justified running header to the first master page."""
+        if styles_tree is None:
+            return
+        from lxml import etree
+        ns_s = self._NS_STYLE
+        ns_fo = self._NS_FO
+        ns_text = self._NS_TEXT
+        ns_office = 'urn:oasis:names:tc:opendocument:xmlns:office:1.0'
 
-        pn = etree.SubElement(p, f'{{{ns_text}}}page-number')
-        pn.set(f'{{{ns_s}}}num-format', '1')
-        if start_page is not None and start_page > 1:
-            pn.set(f'{{{ns_text}}}page-adjust', str(start_page - 1))
-        pn.tail = ':'
+        root = styles_tree.getroot()
+        auto_styles = root.find(f'{{{ns_office}}}automatic-styles')
+        if auto_styles is None:
+            return
 
-        if total_pages is not None:
-            pc = etree.SubElement(p, f'{{{ns_text}}}span')
-            pc.text = str(total_pages)
+        # Ensure a right-justified running header paragraph style exists.
+        existing = {el.get(f'{{{ns_s}}}name')
+                    for el in auto_styles.iter(f'{{{ns_s}}}style')}
+        if 'OneUnRunningHeader' not in existing:
+            style_el = etree.SubElement(auto_styles, f'{{{ns_s}}}style')
+            style_el.set(f'{{{ns_s}}}name', 'OneUnRunningHeader')
+            style_el.set(f'{{{ns_s}}}family', 'paragraph')
+            pp = etree.SubElement(style_el, f'{{{ns_s}}}paragraph-properties')
+            pp.set(f'{{{ns_fo}}}text-align', 'right')
+            pp.set(f'{{{ns_fo}}}margin-top', '0in')
+            pp.set(f'{{{ns_fo}}}margin-bottom', '0in')
+            tp = etree.SubElement(style_el, f'{{{ns_s}}}text-properties')
+            tp.set(f'{{{ns_fo}}}font-family', 'Helvetica')
+            tp.set(f'{{{ns_fo}}}font-size', '11pt')
+
+        master_styles = root.find(f'{{{ns_office}}}master-styles')
+        if master_styles is None:
+            return
+        master = master_styles.find(f'{{{ns_s}}}master-page')
+        if master is None:
+            return
+
+        # Replace any existing header on this master page.
+        header = master.find(f'{{{ns_s}}}header')
+        if header is not None:
+            master.remove(header)
+        header = etree.SubElement(master, f'{{{ns_s}}}header')
+        p = etree.SubElement(header, f'{{{ns_text}}}p')
+        p.set(f'{{{ns_text}}}style-name', 'OneUnRunningHeader')
+
+        quiz_date = metadata.get('quiz_date', '')
+        if section_code:
+            header_text = (
+                f"Student:\xa0{student_name}, "
+                f"Section:\xa0{section_code}, "
+                f"created:\xa0{quiz_date}"
+            )
         else:
-            pc = etree.SubElement(p, f'{{{ns_text}}}page-count')
-            pc.set(f'{{{ns_s}}}num-format', '1')
+            header_text = (
+                f"Student:\xa0{student_name}, "
+                f"created:\xa0{quiz_date}"
+            )
+        p.text = header_text.replace(' ', '\xa0')
+
+    def _reduce_page_margins_for_signature(self, styles_tree) -> None:
+        """Shrink top/bottom page margins so the prepended signature line fits
+        on page 1 without pushing template content onto an extra blank page.
+        """
+        if styles_tree is None:
+            return
+        from lxml import etree
+        ns_s = self._NS_STYLE
+        ns_fo = self._NS_FO
+
+        root = styles_tree.getroot()
+        for pl in root.iter(f'{{{ns_s}}}page-layout-properties'):
+            for attr in ('margin-top', 'margin-bottom'):
+                full = f'{{{ns_fo}}}{attr}'
+                val = pl.get(full)
+                if val is None:
+                    continue
+                # Only shrink values known to be at least 0.6in; ignore others.
+                if val.endswith('in'):
+                    try:
+                        if float(val[:-2]) > 0.6:
+                            pl.set(full, '0.6in')
+                    except ValueError:
+                        pass
+
+    def _normalize_token_spans(self, root, definition: ProblemDefinition, ns: Dict):
+        """Merge inline text spans that split known variable/constant tokens.
+
+        Writer can store a single token such as ``$Naout`` as ``$Na`` in the
+        parent paragraph and ``out`` in a styled ``<text:span>``.  This pass
+        joins such runs so the later per-node substitutions see the complete
+        token.  The inline span that carried the suffix is emptied.
+        """
+        known = set(definition.variables.keys()) | set(definition.constants.keys())
+        if not known:
+            return
+
+        token_re = re.compile('|'.join(map(re.escape, sorted(known, key=len, reverse=True))))
+        text_ns = ns.get('text', 'urn:oasis:names:tc:opendocument:xmlns:text:1.0')
+        block_p = f'{{{text_ns}}}p'
+        block_h = f'{{{text_ns}}}h'
+
+        def walk(elem, include_tail=True):
+            if elem.text is not None:
+                yield elem, 'text', elem.text
+            for child in elem:
+                yield from walk(child, True)
+            if include_tail and elem.tail is not None:
+                yield elem, 'tail', elem.tail
+
+        for block in list(root.iter(block_p, block_h)):
+            while True:
+                segments = list(walk(block, include_tail=False))
+                full = ''.join(text for _, _, text in segments)
+                segment_starts = []
+                pos = 0
+                for _, _, text in segments:
+                    segment_starts.append(pos)
+                    pos += len(text)
+
+                split_match = None
+                for m in token_re.finditer(full):
+                    s, e = m.start(), m.end()
+                    i = j = None
+                    a = b = 0
+                    for idx, start in enumerate(segment_starts):
+                        seg_end = start + len(segments[idx][2])
+                        if i is None and start <= s < seg_end:
+                            i = idx
+                            a = s - start
+                        if j is None and start <= e <= seg_end:
+                            j = idx
+                            b = e - start
+                            break
+                    if i is not None and j is not None and i != j:
+                        split_match = (i, j, a, b, m.group(0))
+                        break
+
+                if split_match is None:
+                    break
+
+                i, j, a, b, token = split_match
+                seg_i_elem, seg_i_attr, seg_i_text = segments[i]
+                seg_j_elem, seg_j_attr, seg_j_text = segments[j]
+                prefix = seg_i_text[:a]
+                suffix = seg_j_text[b:]
+                setattr(seg_i_elem, seg_i_attr, prefix + token)
+                for k in range(i + 1, j):
+                    elem_k, attr_k, _ = segments[k]
+                    setattr(elem_k, attr_k, '')
+                setattr(seg_j_elem, seg_j_attr, suffix)
 
     def _substitute_constants(self, root, definition: ProblemDefinition):
         """Replace #ConstName tokens in text nodes with their fixed values.
@@ -1248,7 +1372,11 @@ class TemplateProcessor:
                 or item.attr not in allowed_functions
             ):
                 raise ValueError(f'Computed answer expressions may contain only numeric arithmetic: {expression!r}')
-            if isinstance(item, ast.Call) and (item.keywords or len(item.args) != 1):
+            if isinstance(item, ast.Call) and (
+                item.keywords
+                or len(item.args) != 1
+                or not isinstance(item.func, (ast.Name, ast.Attribute))
+            ):
                 raise ValueError(f'Computed answer functions require one numeric argument: {expression!r}')
         result = eval(compile(node, '<oneun-answer>', 'eval'), {'__builtins__': {}, 'math': math}, {})
         # Round final numeric answer to 3 decimal places, trim trailing zeros.
@@ -1261,8 +1389,6 @@ class TemplateProcessor:
 
     @classmethod
     def _render_answer_line(cls, answer: str) -> str:
-        if len(answer) >= 2 and answer[0] in "\"'" and answer[-1] == answer[0]:
-            return answer[1:-1]
         if answer.startswith('='):
             return cls._evaluate_answer_expression(answer[1:].strip())
         return answer
@@ -1270,14 +1396,16 @@ class TemplateProcessor:
     @classmethod
     def _make_answer_key_frame(cls, frame, ns: Dict, text_content: str):
         lines = [line.strip() for line in text_content.splitlines() if line.strip()]
-        if len(lines) < 2:
-            raise ValueError('An answer-key frame must contain its {{answer...}} name followed by one answer line.')
-        if len(lines) > 2:
-            raise ValueError('An answer-key frame may contain only one answer line after its {{answer...}} name.')
-        cls._set_frame_text(frame, ns, cls._render_answer_line(lines[1]))
+        answer_lines = lines[1:]
+        if not answer_lines:
+            raise ValueError('An answer-key frame must contain its {{answer...}} name followed by one or two answer lines.')
+        if len(answer_lines) > 2:
+            raise ValueError('An answer-key frame may contain at most two answer lines after its {{answer...}} name.')
+        rendered = [cls._render_answer_line(line) for line in answer_lines]
+        cls._set_frame_text(frame, ns, rendered)
 
     @staticmethod
-    def _set_frame_text(frame, ns: Dict, value: str):
+    def _set_frame_text(frame, ns: Dict, values: List[str]):
         text_ns = ns['text']
         paragraphs = list(frame.iter(f"{{{text_ns}}}p"))
         if not paragraphs:
@@ -1287,7 +1415,16 @@ class TemplateProcessor:
             for sub in list(paragraph):
                 paragraph.remove(sub)
             paragraph.text = None
-        first.text = value
+        for i, value in enumerate(values):
+            if i < len(paragraphs):
+                paragraphs[i].text = value
+            else:
+                new_p = deepcopy(first)
+                for sub in list(new_p):
+                    new_p.remove(sub)
+                new_p.text = value
+                paragraphs[-1].addnext(new_p)
+                paragraphs.append(new_p)
 
     @staticmethod
     def _make_answer_frame(frame, ns: Dict):
@@ -1358,24 +1495,26 @@ class OneUnODTGenerator:
                       student_codes: Optional[List[str]] = None,
                       quiz_metadata: Optional[Dict] = None,
                       plot_config: Optional[Dict] = None,
-                      mode: str = 'random',
                       output_ids: Optional[Dict[str, str]] = None,
                       answer_key_template_path: Optional[str] = None,
                       answer_key_output_ids: Optional[Dict[str, str]] = None,
                       student_names: Optional[Dict[str, str]] = None,
+                      student_section_codes: Optional[Dict[str, str]] = None,
                       base_seed: Optional[int] = None,
                       start_question: Optional[int] = None,
-                      start_page: Optional[int] = None) -> List[str]:
-        """Generate one ODT quiz per student and write a summary log.
+                      start_page: Optional[int] = None,
+                      attempts: int = 1,
+                      return_values: bool = False) -> Union[List[str], Tuple[List[str], List[str], Dict[str, List[Dict]]]]:
+        """Generate ODT quiz files per student and attempt, and write a summary log.
 
-        One Problem instance is generated per equation in the definition.
-        The number of output files equals the number of student codes.
+        One Problem instance is generated per equation/attempt in the definition.
+        The number of output files equals student_codes * attempts.
 
         Args:
             definition: Parsed ProblemDefinition (from .txt file)
             template_path: Path to the ODT template (required)
-            output_path: Base output file path; student code is appended
-                         for each student.
+            output_path: Base output file path; student code and attempt are
+                         appended for each generated file.
             student_codes: List of student code strings.  One ODT is
                            produced per entry.  Pass [''] for a single
                            generic output.
@@ -1389,13 +1528,19 @@ class OneUnODTGenerator:
                 - use_gridlines (bool)
                 - log_x (bool)
                 - log_y (bool)
-            mode: 'random' or 'pseudo_random'
             base_seed: If given, per-student seeds are derived as
-                       base_seed + student_index so each student gets a
-                       different but reproducible set of values.
+                       base_seed + student_index.  Each attempt uses an
+                       incremented seed so no two attempts for the same
+                       student use the same random state.
+            attempts: Number of quiz variants to generate per student.
+            return_values: If True, also return a mapping of student code to
+                           a list of the drawn variable value dicts (one per attempt).
 
         Returns:
-            List of paths to the generated ODT files.
+            List of paths to the generated ODT files, or a tuple of
+            (main_files, answer_key_files, student_odt_values) if
+            return_values is True.  When return_values is False, main and
+            answer-key files are concatenated in the returned list.
         """
         import tempfile
         import shutil as _shutil
@@ -1425,9 +1570,11 @@ class OneUnODTGenerator:
         base_dir = os.path.dirname(os.path.abspath(output_path))
         os.makedirs(base_dir, exist_ok=True)
 
-        generator = ProblemGenerator(definition)
+        attempts = max(1, int(attempts))
         generated_files: List[str] = []
+        answer_key_files: List[str] = []
         student_seeds: Dict[str, Any] = {}
+        odt_values: Dict[str, List[Dict]] = {}
 
         for idx, student_code in enumerate(student_codes):
             # Derive a per-student seed
@@ -1437,99 +1584,115 @@ class OneUnODTGenerator:
                 student_seed = None
             student_seeds[student_code or f'generic_{idx}'] = student_seed
 
-            # Generate the Problem (one value per variable) for this student
-            problems = generator.generate_for_student(
-                mode=mode, seed=student_seed
-            )
+            # Each student gets a fresh ProblemGenerator so attempts for that
+            # student do not reuse values until the value pool is exhausted.
+            generator = ProblemGenerator(definition)
 
-            # Build graph images dict: graph_N -> png_path for each equation
-            tmp_dir = tempfile.mkdtemp()
-            graph_images: Dict[str, str] = {}
-            try:
-                if include_graph:
-                    eq_index = plot_cfg.get('equation_index', 1)
-                    x_var = plot_cfg.get('x_var', '')
-                    y_var = plot_cfg.get('y_var', '')
-                    equation = self._get_equation(definition, eq_index)
+            section_code = (student_section_codes or {}).get(student_code, '')
 
-                    if equation and x_var and y_var:
-                        if (x_var in equation.variables and
-                                y_var in equation.variables):
-                            # Find the matching problem instance
-                            prob = next(
-                                (p for p in problems
-                                 if p.equation_index == eq_index),
-                                problems[0]
-                            )
-                            fixed = {k: v for k, v in prob.given_values.items()
-                                     if k != x_var and k != y_var}
-                            png_path = os.path.join(tmp_dir, f"graph_{eq_index}.png")
-                            try:
-                                self.plot_generator.generate(
-                                    equation=equation,
-                                    x_var=x_var, y_var=y_var,
-                                    fixed_values=fixed,
-                                    definition=definition,
-                                    output_path=png_path,
-                                    use_gridlines=plot_cfg.get('use_gridlines', True),
-                                    log_x=plot_cfg.get('log_x', False),
-                                    log_y=plot_cfg.get('log_y', False),
-                                )
-                                graph_images[f'graph_{eq_index}'] = png_path
-                                graph_images['graph'] = png_path
-                            except Exception as e:
-                                print(f"Warning: plot failed for student "
-                                      f"'{student_code}': {e}")
+            for attempt in range(1, attempts + 1):
+                attempt_seed = (student_seed + (attempt - 1)
+                                if student_seed is not None else None)
 
-                fname_stem = os.path.basename(out_stem)
-                output_id = output_ids.get(student_code)
-                if output_id:
-                    out_file = os.path.join(base_dir, f"{output_id}.odt")
-                elif student_code:
-                    out_file = os.path.join(
-                        base_dir, f"{fname_stem}_{student_code}.odt"
-                    )
-                else:
-                    out_file = os.path.join(base_dir, f"{fname_stem}.odt")
-
-                student_name = (student_names or {}).get(student_code, student_code)
-
-                self.template_processor.process(
-                    template_path=template_path,
-                    output_path=out_file,
-                    problems=problems,
-                    definition=definition,
-                    graph_images=graph_images,
-                    metadata=metadata if metadata else None,
-                    student_code=output_id or student_code or '',
-                    student_name=student_name or ''
+                # Generate the Problem (one value per variable) for this attempt
+                problems = generator.generate_for_student(seed=attempt_seed)
+                odt_values.setdefault(student_code or f'generic_{idx}', []).append(
+                    dict(problems[0].given_values)
                 )
-                generated_files.append(out_file)
 
-                if answer_key_template_path:
-                    answer_key_id = answer_key_output_ids.get(student_code)
-                    if answer_key_id:
-                        answer_key_file = os.path.join(base_dir, f"{answer_key_id}.odt")
+                # Build graph images dict: graph_N -> png_path for each equation
+                tmp_dir = tempfile.mkdtemp()
+                graph_images: Dict[str, str] = {}
+                try:
+                    if include_graph:
+                        eq_index = plot_cfg.get('equation_index', 1)
+                        x_var = plot_cfg.get('x_var', '')
+                        y_var = plot_cfg.get('y_var', '')
+                        equation = self._get_equation(definition, eq_index)
+
+                        if equation and x_var and y_var:
+                            if (x_var in equation.variables and
+                                    y_var in equation.variables):
+                                # Find the matching problem instance
+                                prob = next(
+                                    (p for p in problems
+                                     if p.equation_index == eq_index),
+                                    problems[0]
+                                )
+                                fixed = {k: v for k, v in prob.given_values.items()
+                                         if k != x_var and k != y_var}
+                                png_path = os.path.join(tmp_dir, f"graph_{eq_index}.png")
+                                try:
+                                    self.plot_generator.generate(
+                                        equation=equation,
+                                        x_var=x_var, y_var=y_var,
+                                        fixed_values=fixed,
+                                        definition=definition,
+                                        output_path=png_path,
+                                        use_gridlines=plot_cfg.get('use_gridlines', True),
+                                        log_x=plot_cfg.get('log_x', False),
+                                        log_y=plot_cfg.get('log_y', False),
+                                    )
+                                    graph_images[f'graph_{eq_index}'] = png_path
+                                    graph_images['graph'] = png_path
+                                except Exception as e:
+                                    print(f"Warning: plot failed for student "
+                                          f"'{student_code}' attempt {attempt}: {e}")
+
+                    attempt_suffix = f"_A{attempt}" if attempts > 1 else ""
+
+                    fname_stem = os.path.basename(out_stem)
+                    output_id = output_ids.get(student_code)
+                    if output_id:
+                        out_file = os.path.join(base_dir, f"{output_id}{attempt_suffix}.odt")
                     elif student_code:
-                        answer_key_file = os.path.join(base_dir, f"{fname_stem}_{student_code}_answer_key.odt")
+                        out_file = os.path.join(
+                            base_dir, f"{fname_stem}_{student_code}{attempt_suffix}.odt"
+                        )
                     else:
-                        answer_key_file = os.path.join(base_dir, f"{fname_stem}_answer_key.odt")
-                    answer_key_metadata = dict(metadata)
-                    answer_key_metadata['doc_type'] = f"{metadata.get('doc_type', 'Quiz')} Answer Key"
+                        out_file = os.path.join(base_dir, f"{fname_stem}{attempt_suffix}.odt")
+
+                    student_name = (student_names or {}).get(student_code, student_code)
+
                     self.template_processor.process(
-                        template_path=answer_key_template_path,
-                        output_path=answer_key_file,
+                        template_path=template_path,
+                        output_path=out_file,
                         problems=problems,
                         definition=definition,
                         graph_images=graph_images,
-                        metadata=answer_key_metadata,
+                        metadata=metadata if metadata else None,
                         student_code=output_id or student_code or '',
                         student_name=student_name or '',
-                        answer_key=True,
+                        section_code=section_code,
                     )
+                    generated_files.append(out_file)
 
-            finally:
-                _shutil.rmtree(tmp_dir, ignore_errors=True)
+                    if answer_key_template_path:
+                        answer_key_id = answer_key_output_ids.get(student_code)
+                        if answer_key_id:
+                            answer_key_file = os.path.join(base_dir, f"{answer_key_id}{attempt_suffix}.odt")
+                        elif student_code:
+                            answer_key_file = os.path.join(base_dir, f"{fname_stem}_{student_code}_answer_key{attempt_suffix}.odt")
+                        else:
+                            answer_key_file = os.path.join(base_dir, f"{fname_stem}_answer_key{attempt_suffix}.odt")
+                        answer_key_metadata = dict(metadata)
+                        answer_key_metadata['doc_type'] = f"{metadata.get('doc_type', 'Quiz')} Answer Key"
+                        self.template_processor.process(
+                            template_path=answer_key_template_path,
+                            output_path=answer_key_file,
+                            problems=problems,
+                            definition=definition,
+                            graph_images=graph_images,
+                            metadata=answer_key_metadata,
+                            student_code=output_id or student_code or '',
+                            student_name=student_name or '',
+                            section_code=section_code,
+                            answer_key=True,
+                        )
+                    answer_key_files.append(answer_key_file)
+
+                finally:
+                    _shutil.rmtree(tmp_dir, ignore_errors=True)
 
         # Write summary log
         log_path = f"{out_stem}_summary.txt"
@@ -1537,16 +1700,17 @@ class OneUnODTGenerator:
             log_path=log_path,
             definition_path=None,
             template_path=template_path,
-            output_files=generated_files,
+            output_files=generated_files + answer_key_files,
             student_seeds=student_seeds,
             metadata=metadata,
-            mode=mode,
             plot_config=plot_cfg,
             generated_at=datetime.now().isoformat(timespec='seconds')
         )
         print(f"Summary log written: {log_path}")
 
-        return generated_files
+        if return_values:
+            return generated_files, answer_key_files, odt_values
+        return generated_files + answer_key_files
 
     @staticmethod
     def _write_summary_log(log_path: str,
@@ -1555,7 +1719,6 @@ class OneUnODTGenerator:
                            output_files: List[str],
                            student_seeds: Dict[str, Any],
                            metadata: Dict,
-                           mode: str,
                            plot_config: Dict,
                            generated_at: str):
         """Write a plain-text summary log for the generation run."""
@@ -1572,7 +1735,6 @@ class OneUnODTGenerator:
             "",
             "Parameters",
             "----------",
-            f"  Mode       : {mode}",
             f"  Course     : {metadata.get('course', '')}",
             f"  Instructors: {metadata.get('instructors', '')}",
             f"  Quiz date  : {metadata.get('quiz_date', '')}",
@@ -1631,81 +1793,5 @@ def load_problem_definition(filepath: str) -> ProblemDefinition:
     """Load a problem definition from a text file."""
     return ProblemDefinitionParser.parse_file(filepath)
 
-
-def generate_problems_for_student(definition: ProblemDefinition,
-                                  mode: str = 'random',
-                                  seed: Optional[int] = None) -> List[Problem]:
-    """Generate one Problem per equation for a single student.
-
-    Args:
-        definition: Parsed problem definition
-        mode: 'random' or 'pseudo_random'
-        seed: Optional random seed
-
-    Returns:
-        List of Problem objects (one per equation, in equation order)
-    """
-    gen = ProblemGenerator(definition)
-    return gen.generate_for_student(mode=mode, seed=seed)
-
-
-def create_quiz_odt(definition_path: str,
-                    template_path: str,
-                    output_path: str = 'oneun_quiz.odt',
-                    student_codes: Optional[List[str]] = None,
-                    mode: str = 'random',
-                    quiz_metadata: Optional[Dict] = None,
-                    plot_config: Optional[Dict] = None,
-                    base_seed: Optional[int] = None) -> List[str]:
-    """End-to-end: parse definition, generate per-student ODTs.
-
-    Args:
-        definition_path: Path to problem definition text file
-        template_path: Path to ODT template (required)
-        output_path: Base output path; student code is appended per student
-        student_codes: List of student codes (one ODT per entry)
-        mode: 'random' or 'pseudo_random'
-        quiz_metadata: Quiz metadata dict
-        plot_config: Plot configuration dict (see OneUnODTGenerator.generate_quiz)
-        base_seed: Base seed; per-student seeds are base_seed + student_index
-
-    Returns:
-        List of paths to generated ODT files
-    """
-    definition = load_problem_definition(definition_path)
-    odt_gen = OneUnODTGenerator()
-    return odt_gen.generate_quiz(
-        definition=definition,
-        template_path=template_path,
-        output_path=output_path,
-        student_codes=student_codes,
-        quiz_metadata=quiz_metadata,
-        plot_config=plot_config,
-        mode=mode,
-        base_seed=base_seed
-    )
-
-
-def get_odt_template_page_count(template_path: str) -> Optional[int]:
-    """Return the saved page count from an .odt template's meta.xml, or None."""
-    import zipfile
-    from lxml import etree
-    try:
-        with zipfile.ZipFile(template_path, 'r') as z:
-            meta_bytes = z.read('meta.xml')
-    except (KeyError, zipfile.BadZipFile, FileNotFoundError):
-        return None
-    root = etree.fromstring(meta_bytes)
-    ns = {'meta': 'urn:oasis:names:tc:opendocument:xmlns:meta:1.0'}
-    stat = root.find('.//meta:document-statistic', namespaces=ns)
-    if stat is not None:
-        ns_meta = 'urn:oasis:names:tc:opendocument:xmlns:meta:1.0'
-        count = stat.get(f'{{{ns_meta}}}page-count')
-        if count is not None:
-            try:
-                return int(count)
-            except ValueError:
-                pass
-    return None
 
 

@@ -6,13 +6,12 @@ extraction where possible.  It intentionally avoids the legacy monolithic
 _grade_single_quiz function: parsing, scoring, persistence, and email are
 separated so that MCQ26 can mix MCQ and quantitative (ODT) components.
 
-Scan parsing currently delegates to the legacy bubbleSheet/MCQ/quiz_scanner.py
-routines.  Those routines can be copied and adapted to MCQ26 later without
-changing this orchestration layer.
+Scan parsing uses quiz_scanner26.py/qr_detector26.py, MCQ26's own copies of
+the (adapted) legacy scan-parsing routines - MCQ26 doesn't depend on the
+separate bubbleSheet/MCQ repo for grading.
 """
 import os
 import re
-import sys
 import json
 import logging
 from dataclasses import dataclass, field
@@ -20,31 +19,50 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
+from PIL import Image
+
 from database26 import (
     create_db_engine,
+    get_quiz_questions,
     get_student_by_code,
     record_quiz_attempt,
 )
+from document_ids26 import format_quiz_id
+import bubble_scoring26
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Legacy MCQ package path setup
+# Scanner setup
 # ---------------------------------------------------------------------------
-def _ensure_legacy_mcq_path() -> None:
-    """Make bubbleSheet/MCQ importable as the 'MCQ' package.
+def _ensure_scanner_ready() -> None:
+    """One-time setup needed before importing quiz_scanner26.
 
-    Some legacy modules use bare imports such as 'from database import ...'
-    instead of 'from MCQ.database import ...', so we also add bubbleSheet/MCQ
-    itself to sys.path as a compatibility shim.
+    quiz_scanner26.py/qr_detector26.py are MCQ26's own copies of the scan-
+    parsing routines (no dependency on the separate bubbleSheet/MCQ repo);
+    this just makes sure pyzbar can find the zbar shared library first.
     """
-    text_processing_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    bubble_sheet_dir = os.path.join(text_processing_dir, 'bubbleSheet')
-    mcq_pkg_dir = os.path.join(bubble_sheet_dir, 'MCQ')
-    for p in (bubble_sheet_dir, mcq_pkg_dir):
-        if p not in sys.path:
-            sys.path.insert(0, p)
+    _ensure_zbar_library_path()
+
+
+def _ensure_zbar_library_path() -> None:
+    """Help pyzbar find the Homebrew-installed zbar shared library.
+
+    On Apple Silicon, `ctypes.util.find_library` (used by pyzbar) doesn't
+    search /opt/homebrew/lib by default, so pyzbar.pyzbar.decode() fails to
+    import with "Unable to find zbar shared library" even when `brew install
+    zbar` has been run. Setting DYLD_LIBRARY_PATH before pyzbar is imported
+    fixes this without requiring any shell/venv configuration.
+    """
+    homebrew_lib = '/opt/homebrew/lib'
+    if not os.path.isdir(homebrew_lib):
+        return
+    existing = os.environ.get('DYLD_LIBRARY_PATH', '')
+    if homebrew_lib not in existing.split(os.pathsep):
+        os.environ['DYLD_LIBRARY_PATH'] = (
+            f'{homebrew_lib}{os.pathsep}{existing}' if existing else homebrew_lib
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +90,13 @@ class GradingResult:
     validation_issues: List[str] = field(default_factory=list)
     held_up: bool = False
     scan_file: Optional[str] = None
-    qsession_folder: Optional[str] = None
+    unresolved_image_path: Optional[str] = None
+    overwrite_declined: bool = False
+    # Raw scanned page images for this quiz (all pages, printed order). Kept
+    # around only while a quiz is held up, so bubble-position detection can
+    # be deferred until the quiz_id (and thus its calibration metadata) is
+    # known - see resolve_held_up_result. Cleared once no longer needed.
+    page_images: List[Any] = field(default_factory=list, repr=False)
 
     @property
     def total_score(self) -> float:
@@ -108,9 +132,9 @@ class GradingResult:
 # ---------------------------------------------------------------------------
 # Scan parsing (delegated to legacy routines for now)
 # ---------------------------------------------------------------------------
-def _import_legacy_scanner():
-    _ensure_legacy_mcq_path()
-    from MCQ.quiz_scanner import (
+def _import_scanner():
+    _ensure_scanner_ready()
+    from quiz_scanner26 import (
         process_scan_file,
         process_block_scans,
         ScannedQuiz,
@@ -133,61 +157,174 @@ def _index_for_letter(letter: str) -> Optional[int]:
     return None
 
 
-def parse_scan_file(scan_path: str) -> List[GradingResult]:
+def _score_against_database(
+    engine,
+    quiz_id: str,
+    student_answers: Dict[int, List[str]],
+) -> Tuple[List[ComponentScore], Dict[int, Optional[str]]]:
+    """Score scanned answers against the quiz's own stored correct answers.
+
+    Correct answers (and the question count) come from the QuizQuestion rows
+    saved in the database when the quiz was generated
+    (database26.get_quiz_questions), so no separate answer-key file needs to
+    be located on disk - the quiz_id alone is sufficient.
+    """
+    questions = get_quiz_questions(engine, quiz_id)
+    if not questions:
+        raise ValueError(f'No generated quiz found in the database for {quiz_id}')
+
+    correct_answers: Dict[int, Optional[str]] = {}
+    correct_count = 0
+    for question in questions:
+        q_num = question['question_number']
+        letter = _letter_for_index(question['correct_answer_index'])
+        correct_answers[q_num] = letter
+        given = student_answers.get(q_num)
+        if letter is not None and given and letter in given:
+            correct_count += 1
+
+    total = len(questions)
+    components = [ComponentScore(
+        component_type='mcq',
+        correct=correct_count,
+        total=total,
+        score_pct=100.0 * correct_count / total if total else 0.0,
+    )]
+    return components, correct_answers
+
+
+def _read_answers_for_quiz_id(
+    course_folder: str, quiz_id: str, page_images: List[Any],
+) -> Tuple[Dict[int, List[str]], List[str]]:
+    """Locate a quiz's calibration metadata and read its scanned bubble answers.
+
+    Raises ValueError if the metadata file (written at generation time)
+    can't be found - this happens if the quiz_id is wrong (e.g. a manual
+    resolution typo) or its files were never generated/have been moved.
+    """
+    metadata = bubble_scoring26.load_quiz_metadata(course_folder, quiz_id)
+    if metadata is None:
+        path = bubble_scoring26.quiz_metadata_path(course_folder, quiz_id)
+        raise ValueError(f'No quiz metadata found for {quiz_id} (expected at {path})')
+    return bubble_scoring26.read_quiz_answers(page_images, metadata)
+
+
+def parse_scan_file(engine, scan_path: str, grading_dir: str, course_folder: str) -> List[GradingResult]:
     """Parse a single scan PDF into a list of GradingResult objects.
 
-    Legacy routine used: bubbleSheet/MCQ/quiz_scanner.py:process_scan_file
+    Quiz identity (quiz_id, student_code) is read from the QR code on each
+    quiz's first page. For quizzes whose identity is readable, answers are
+    read immediately by locating that quiz's own generation-time bubble
+    position metadata (see bubble_scoring26) and scoring against the
+    database. Any quiz whose ID or student code cannot be read is marked
+    `held_up=True`; its first-page image is saved under
+    `<grading_dir>/unresolved/` for display, and *all* of its page images are
+    kept on the result so bubble-position detection can be deferred until
+    the quiz_id becomes known via manual resolution (see
+    `resolve_held_up_result`) - the calibration metadata can't be located
+    without first knowing which quiz this is.
+
+    Scan-parsing routine used: quiz_scanner26.py:process_scan_file
     """
-    process_scan_file, _, _ = _import_legacy_scanner()
+    process_scan_file, _, _ = _import_scanner()
     scanned_quizzes = process_scan_file(Path(scan_path))
+    unresolved_dir = Path(grading_dir) / 'unresolved'
+
     results = []
-    for sq in scanned_quizzes:
-        # Convert legacy letter answers to index lists.
-        student_answers: Dict[int, List[str]] = {}
-        correct_answers: Dict[int, Optional[str]] = {}
-        for q_num, letter in (sq.answers or {}).items():
-            student_answers[int(q_num)] = [letter] if isinstance(letter, str) else list(letter)
-
-        # Legacy ScannedQuiz.score is already a percentage (0-100) or None.
-        score_pct = sq.score if sq.score is not None else 0.0
-        total_questions = len(sq.answers or {})
-        correct_count = round(score_pct * total_questions / 100.0) if total_questions else 0
-
-        components = []
-        if total_questions > 0:
-            components.append(ComponentScore(
-                component_type='mcq',
-                correct=correct_count,
-                total=total_questions,
-                score_pct=score_pct,
-            ))
-
+    for index, sq in enumerate(scanned_quizzes, 1):
         page_info = []
+        page_images = []
         for page in (sq.pages or []):
             page_info.append({
                 'page_number': getattr(page, 'page_number', None),
                 'page_type': getattr(page, 'page_type', None),
             })
+            if getattr(page, 'image', None) is not None:
+                page_images.append(page.image)
 
-        results.append(GradingResult(
+        is_unresolved = not sq.quiz_id or sq.quiz_id.startswith('unknown_') or not sq.student_code
+
+        result = GradingResult(
             quiz_id=sq.quiz_id,
             student_code=sq.student_code,
-            module_number=_extract_module_number(sq.quiz_id),
+            module_number=_extract_module_number(sq.quiz_id) if not is_unresolved else 0,
             pages=page_info,
-            student_answers=student_answers,
-            correct_answers=correct_answers,
-            components=components,
             scan_file=str(scan_path),
-        ))
+        )
+
+        if is_unresolved:
+            result.held_up = True
+            result.page_images = page_images
+            result.validation_issues.append('Could not read quiz ID / student code from QR code.')
+            if page_images:
+                unresolved_dir.mkdir(parents=True, exist_ok=True)
+                image_path = unresolved_dir / f'unresolved_{index}.png'
+                try:
+                    Image.fromarray(page_images[0]).save(image_path)
+                    result.unresolved_image_path = str(image_path)
+                except Exception as e:
+                    logger.warning(f"Could not save unresolved scan image: {e}")
+        else:
+            try:
+                student_answers, issues = _read_answers_for_quiz_id(course_folder, sq.quiz_id, page_images)
+                result.student_answers = student_answers
+                result.validation_issues.extend(issues)
+                components, correct_answers = _score_against_database(engine, sq.quiz_id, student_answers)
+                result.components = components
+                result.correct_answers = correct_answers
+            except ValueError as e:
+                result.held_up = True
+                result.page_images = page_images
+                result.validation_issues.append(str(e))
+
+        results.append(result)
     return results
+
+
+def resolve_held_up_result(
+    engine,
+    result: GradingResult,
+    module_number: int,
+    student_code: str,
+    quiz_number: int,
+    course_folder: str,
+) -> GradingResult:
+    """Manually resolve a held-up scan using grader-supplied identifiers.
+
+    Builds the quiz_id from *module_number*, *student_code*, and
+    *quiz_number* (the 4-digit attempt sequence after the underscore),
+    verifies the student exists, then locates that quiz's calibration
+    metadata (now resolvable since quiz_id is known) to read its scanned
+    answers and scores them against the database. Mutates and returns
+    *result*. Raises ValueError if the student, quiz metadata, or generated
+    quiz can't be found.
+    """
+    student = get_student_by_code(engine, student_code)
+    if student is None:
+        raise ValueError(f'No enrolled student found with code {student_code!r}')
+
+    quiz_id = format_quiz_id(student_code, module_number, quiz_number)
+    student_answers, issues = _read_answers_for_quiz_id(course_folder, quiz_id, result.page_images)
+    components, correct_answers = _score_against_database(engine, quiz_id, student_answers)
+
+    result.quiz_id = quiz_id
+    result.student_code = student_code
+    result.module_number = module_number
+    result.student_answers = student_answers
+    result.validation_issues.extend(issues)
+    result.components = components
+    result.correct_answers = correct_answers
+    result.held_up = False
+    result.page_images = []
+    return result
 
 
 def grade_block_scans(block_id: int, course_info: Optional[Dict] = None) -> List[GradingResult]:
     """Process all scans for a quiz block and return graded results.
 
-    Legacy routine used: bubbleSheet/MCQ/quiz_scanner.py:process_block_scans
+    Routine used: quiz_scanner26.py:process_block_scans
     """
-    _, process_block_scans, _ = _import_legacy_scanner()
+    _, process_block_scans, _ = _import_scanner()
     scanned_quizzes = process_block_scans(block_id, course_info)
     # Reuse parse logic by converting ScannedQuiz objects.
     results = []
@@ -238,19 +375,20 @@ def _extract_module_number(quiz_id: str) -> int:
 # ---------------------------------------------------------------------------
 # Artifact persistence for regrade
 # ---------------------------------------------------------------------------
-def _parsed_quizzes_dir(qsession_folder: str) -> Path:
-    return Path(qsession_folder) / 'parsed_quizzes26'
+def _parsed_quizzes_dir(grading_dir: str) -> Path:
+    return Path(grading_dir) / 'parsed_quizzes26'
 
 
-def save_grading_artifacts(result: GradingResult, qsession_folder: str) -> Path:
+def save_grading_artifacts(result: GradingResult, grading_dir: str) -> Path:
     """Save JSON artifacts that the manual regrade dialog can reload.
 
     Legacy equivalent: bubbleSheet/MCQ/grade_quiz_new.py writes
     {quiz_id}_results.json and {quiz_id}_correct_answers.json under
     parsed_quizzes/.  MCQ26 keeps the same idea but stores everything in one
-    file per quiz under parsed_quizzes26/.
+    file per quiz under `<grading_dir>/parsed_quizzes26/`, where *grading_dir*
+    is the grading session's own directory (see grading_session26.py).
     """
-    out_dir = _parsed_quizzes_dir(qsession_folder)
+    out_dir = _parsed_quizzes_dir(grading_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     results_file = out_dir / f"{result.quiz_id}_results.json"
 
@@ -279,9 +417,9 @@ def save_grading_artifacts(result: GradingResult, qsession_folder: str) -> Path:
     return results_file
 
 
-def load_grading_artifact(qsession_folder: str, quiz_id: str) -> Optional[Dict[str, Any]]:
+def load_grading_artifact(grading_dir: str, quiz_id: str) -> Optional[Dict[str, Any]]:
     """Load a previously saved grading artifact."""
-    results_file = _parsed_quizzes_dir(qsession_folder) / f"{quiz_id}_results.json"
+    results_file = _parsed_quizzes_dir(grading_dir) / f"{quiz_id}_results.json"
     if not results_file.exists():
         return None
     with open(results_file, 'r') as f:
@@ -291,73 +429,22 @@ def load_grading_artifact(qsession_folder: str, quiz_id: str) -> Optional[Dict[s
 # ---------------------------------------------------------------------------
 # Detailed feedback
 # ---------------------------------------------------------------------------
-def generate_detailed_feedback(
-    qsession_folder: str,
-    module_number: int,
-    incorrect_questions: List[int],
-    quiz_id: str,
-    wrong_answers: Optional[Dict[int, str]] = None,
-) -> str:
+def generate_detailed_feedback(engine, quiz_id: str, incorrect_questions: List[int]) -> str:
     """Build detailed feedback text for incorrect questions.
 
-    Legacy equivalent: bubbleSheet/MCQ/generate_signup_email.py:generate_detailed_feedback
-    MCQ26 reads from the same feedback folder layout.
+    Feedback is read directly from the QuizQuestion rows saved in the
+    database when the quiz was generated (database26.get_quiz_questions),
+    keyed by question_number - no feedback text file needs to be located.
     """
-    feedback_dir = Path(qsession_folder) / 'feedback'
-    if not feedback_dir.exists():
-        return "No detailed feedback available."
-
-    feedback_file = feedback_dir / f"{quiz_id}F.txt"
-    if not feedback_file.exists():
-        alt_dir = Path(qsession_folder) / quiz_id / f"{quiz_id}F"
-        alt_file = alt_dir / f"{quiz_id}F.txt"
-        if alt_file.exists():
-            feedback_file = alt_file
-        else:
-            return "No detailed feedback available for this quiz."
-
-    try:
-        lines = [line.strip() for line in feedback_file.read_text().splitlines() if line.strip()]
-    except Exception as e:
-        logger.warning(f"Could not read feedback file {feedback_file}: {e}")
-        return "No detailed feedback available."
-
-    feedback_items: Dict[int, str] = {}
-    if module_number == 0:
-        # Module 0 pairs question-id lines with per-answer feedback lines.
-        question_id = None
-        for line in lines:
-            if line.endswith('.'):
-                question_id = int(line.strip('.').split()[-1]) if line.strip('.').split()[-1].isdigit() else None
-            elif line and line[0].isalpha() and len(line) > 1 and line[1] == '.' and question_id is not None:
-                answer_letter = line[0]
-                fb_text = line[2:].strip()
-                if wrong_answers and question_id in wrong_answers and wrong_answers[question_id] == answer_letter:
-                    feedback_items[question_id] = fb_text
-    else:
-        all_pairs = []
-        i = 0
-        while i < len(lines):
-            if lines[i].endswith('.'):
-                qid = lines[i].strip('.')
-                fb = lines[i + 1].strip() if i + 1 < len(lines) else ""
-                all_pairs.append((qid, fb))
-                i += 2
-            else:
-                i += 1
-        for q_num in incorrect_questions:
-            idx = q_num - 1
-            if 0 <= idx < len(all_pairs):
-                feedback_items[q_num] = all_pairs[idx][1]
-            else:
-                feedback_items[q_num] = "No specific feedback available for this question."
-
-    if not feedback_items:
+    if not incorrect_questions:
         return "No specific feedback available for your incorrect answers."
 
+    questions = {q['question_number']: q for q in get_quiz_questions(engine, quiz_id)}
+
     parts = ["\nDETAILED FEEDBACK:\n"]
-    for q_num in sorted(feedback_items):
-        parts.append(f"Question {q_num}: {feedback_items[q_num]}")
+    for q_num in sorted(incorrect_questions):
+        feedback = (questions.get(q_num) or {}).get('feedback_text', '').strip()
+        parts.append(f"Question {q_num}: {feedback or 'No specific feedback available for this question.'}")
     return "\n".join(parts)
 
 
@@ -370,6 +457,7 @@ def record_grading_result(
     date_taken: Optional[str] = None,
     time_taken: Optional[str] = None,
     date_signed_up: Optional[str] = None,
+    grading_session_id: Optional[int] = None,
 ) -> Optional[Any]:
     """Record a GradingResult in the MCQ26 database.
 
@@ -402,39 +490,72 @@ def record_grading_result(
         total_questions=total_questions,
         time_taken=time_taken,
         date_signed_up=date_signed_up,
+        grading_session_id=grading_session_id,
     )
 
 
 # ---------------------------------------------------------------------------
 # High-level flow
 # ---------------------------------------------------------------------------
-def grade_and_record_scan_file(
+def record_results(
     engine,
-    scan_path: str,
-    qsession_folder: str,
+    results: List[GradingResult],
+    grading_dir: str,
+    grading_session_id: Optional[int] = None,
     date_taken: Optional[str] = None,
     send_feedback: bool = False,
-):
-    """Grade a scan file, save artifacts, record attempts, and optionally email.
+) -> List[Any]:
+    """Save artifacts and record quiz attempts for all resolved results.
 
-    This is the MCQ26 replacement for the legacy grade_quiz_new.py single-file
-    flow.
+    Results still marked `held_up` are skipped - they must be resolved first
+    via `resolve_held_up_result`. Returns the list of recorded Quiz rows.
     """
-    results = parse_scan_file(scan_path)
     recorded = []
     for result in results:
         if result.held_up:
-            logger.warning(f"Quiz {result.quiz_id} held up: {result.validation_issues}")
-        save_grading_artifacts(result, qsession_folder)
-        quiz = record_grading_result(engine, result, date_taken=date_taken)
+            logger.warning(f"Skipping unresolved scan (quiz {result.quiz_id}): {result.validation_issues}")
+            continue
+        save_grading_artifacts(result, grading_dir)
+        quiz = record_grading_result(
+            engine, result, date_taken=date_taken, grading_session_id=grading_session_id,
+        )
         if quiz is not None:
             recorded.append(quiz)
             if send_feedback:
-                _send_feedback_if_enabled(engine, result, qsession_folder)
+                _send_feedback_if_enabled(engine, result)
     return recorded
 
 
-def _send_feedback_if_enabled(engine, result: GradingResult, qsession_folder: str) -> None:
+def grade_and_record_scan_file(
+    engine,
+    scan_path: str,
+    grading_dir: str,
+    course_folder: str,
+    grading_session_id: Optional[int] = None,
+    date_taken: Optional[str] = None,
+    send_feedback: bool = False,
+) -> Tuple[List[Any], List[GradingResult]]:
+    """Grade a scan file end-to-end and record everything that's resolvable.
+
+    Any quiz whose QR code couldn't be read is left unresolved (not recorded)
+    and returned in the second element of the result tuple so it can be
+    resolved interactively (see `resolve_held_up_result`) and recorded
+    afterwards with `record_results`.
+
+    Returns (recorded_quizzes, pending_results).
+    """
+    results = parse_scan_file(engine, scan_path, grading_dir, course_folder)
+    recorded = record_results(
+        engine, results, grading_dir,
+        grading_session_id=grading_session_id,
+        date_taken=date_taken,
+        send_feedback=send_feedback,
+    )
+    pending = [result for result in results if result.held_up]
+    return recorded, pending
+
+
+def _send_feedback_if_enabled(engine, result: GradingResult) -> None:
     """Queue/send feedback email if autosend is enabled."""
     from email26 import generate_and_send_quiz_feedback
     incorrect = [
@@ -444,12 +565,7 @@ def _send_feedback_if_enabled(engine, result: GradingResult, qsession_folder: st
     detailed = None
     if incorrect:
         try:
-            detailed = generate_detailed_feedback(
-                qsession_folder=qsession_folder,
-                module_number=result.module_number,
-                incorrect_questions=incorrect,
-                quiz_id=result.quiz_id,
-            )
+            detailed = generate_detailed_feedback(engine, result.quiz_id, incorrect)
         except Exception as e:
             logger.warning(f"Could not generate detailed feedback: {e}")
 
