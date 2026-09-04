@@ -19,10 +19,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
+import numpy as np
 from PIL import Image
+from pypdf import PdfReader, PdfWriter
 
 from database26 import (
     create_db_engine,
+    get_quiz_by_id,
     get_quiz_questions,
     get_student_by_code,
     record_quiz_attempt,
@@ -31,6 +34,15 @@ from document_ids26 import format_quiz_id
 import bubble_scoring26
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Test mode
+# ---------------------------------------------------------------------------
+# When True, grading completes but no database writes are performed.  Draft
+# feedback emails are written to text files organized by section, and quant
+# pages are still extracted.  Set to False when moving to production runs.
+TEST_MODE = True
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +110,17 @@ class GradingResult:
     # known - see resolve_held_up_result. Cleared once no longer needed.
     page_images: List[Any] = field(default_factory=list, repr=False)
 
+    # Quant/ODT extraction metadata (populated during parse_scan_file)
+    has_quant: bool = False
+    mcq_page_count: int = 0
+    expected_total_pages: int = 0
+    quant_scan_pages: List[int] = field(default_factory=list)
+    section_number: Optional[int] = None
+    last_name: str = ''
+    first_name: str = ''
+    student_name: str = ''
+    quiz_questions: List[Dict] = field(default_factory=list, repr=False)
+
     @property
     def total_score(self) -> float:
         """Return the overall percentage score (0-100)."""
@@ -138,8 +161,9 @@ def _import_scanner():
         process_scan_file,
         process_block_scans,
         ScannedQuiz,
+        pdf_to_images,
     )
-    return process_scan_file, process_block_scans, ScannedQuiz
+    return process_scan_file, process_block_scans, ScannedQuiz, pdf_to_images
 
 
 def _letter_for_index(idx: Optional[int]) -> Optional[str]:
@@ -161,15 +185,20 @@ def _score_against_database(
     engine,
     quiz_id: str,
     student_answers: Dict[int, List[str]],
-) -> Tuple[List[ComponentScore], Dict[int, Optional[str]]]:
+    questions: Optional[List[Dict]] = None,
+) -> Tuple[List[ComponentScore], Dict[int, Optional[str]], List[Dict]]:
     """Score scanned answers against the quiz's own stored correct answers.
 
     Correct answers (and the question count) come from the QuizQuestion rows
     saved in the database when the quiz was generated
     (database26.get_quiz_questions), so no separate answer-key file needs to
     be located on disk - the quiz_id alone is sufficient.
+
+    If *questions* is already provided it is reused, avoiding a second DB
+    lookup for the same quiz.
     """
-    questions = get_quiz_questions(engine, quiz_id)
+    if questions is None:
+        questions = get_quiz_questions(engine, quiz_id)
     if not questions:
         raise ValueError(f'No generated quiz found in the database for {quiz_id}')
 
@@ -190,7 +219,7 @@ def _score_against_database(
         total=total,
         score_pct=100.0 * correct_count / total if total else 0.0,
     )]
-    return components, correct_answers
+    return components, correct_answers, questions
 
 
 def _read_answers_for_quiz_id(
@@ -209,7 +238,159 @@ def _read_answers_for_quiz_id(
     return bubble_scoring26.read_quiz_answers(page_images, metadata)
 
 
-def parse_scan_file(engine, scan_path: str, grading_dir: str, course_folder: str) -> List[GradingResult]:
+# ---------------------------------------------------------------------------
+# Generated-quiz pagination helpers
+# ---------------------------------------------------------------------------
+def _find_generated_quiz_pdf(course_folder: str, quiz_id: str) -> Optional[Path]:
+    """Return the path to the generated combined MCQ+Quant PDF for *quiz_id*,
+    searching the module quiz folder and any section subfolders.
+    """
+    document = bubble_scoring26.parse_document_id(quiz_id)
+    module_folder = Path(course_folder).expanduser() / f'module{document.module_number}' / 'quizzes'
+    if not module_folder.is_dir():
+        return None
+    target = f'{quiz_id}Q.pdf'
+    for root, _dirs, files in os.walk(module_folder):
+        if target in files:
+            return Path(root) / target
+    return None
+
+
+def _get_mcq_page_count(course_folder: str, quiz_id: str) -> int:
+    """Return the number of MCQ pages from the quiz's generation metadata.
+
+    The metadata JSON records one entry per printed MCQ page; the highest
+    numbered key is therefore the MCQ page count.
+    """
+    metadata = bubble_scoring26.load_quiz_metadata(course_folder, quiz_id)
+    if not metadata:
+        return 0
+    page_nums = [
+        int(k) for k in metadata.keys()
+        if isinstance(k, str) and k.isdigit() and isinstance(metadata[k], dict)
+    ]
+    return max(page_nums) if page_nums else 0
+
+
+def _get_generated_pdf_page_count(course_folder: str, quiz_id: str) -> int:
+    """Return the total page count of the generated combined MCQ+Quant PDF."""
+    path = _find_generated_quiz_pdf(course_folder, quiz_id)
+    if path is None or not path.is_file():
+        return 0
+    try:
+        return len(PdfReader(str(path)).pages)
+    except Exception as e:
+        logger.warning(f'Could not read page count from {path}: {e}')
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Quant page grouping
+# ---------------------------------------------------------------------------
+def _group_key_for_quiz(page) -> Optional[str]:
+    """Return the quiz_id for a classified page, or None if not decodable."""
+    return getattr(page, 'quiz_id', None) or None
+
+
+def _scan_index(page) -> int:
+    return getattr(page, 'page_number', 0) or 0
+
+
+def _reconcile_quant_pages(
+    scanned_quizzes: List[Any],
+    expected_info: Dict[str, Dict[str, Any]],
+) -> List[Any]:
+    """Re-attribute unresolved (no-QR) pages to the MCQ quiz they belong to.
+
+    The generated PDF tells us the total expected number of pages for each
+    quiz.  Pages without a QR code (blank backs and Quant/ODT pages) are
+    assigned to the nearest resolved group that still needs pages to reach its
+    expected total.  This handles the common case where Quant/ODT pages are
+    appended after the MCQ section but occasionally appear out of order in the
+    scanned batch.
+    """
+    resolved = [sq for sq in scanned_quizzes if not _is_unknown_id(sq.quiz_id)]
+    unresolved = [sq for sq in scanned_quizzes if _is_unknown_id(sq.quiz_id)]
+
+    if not unresolved or not resolved:
+        return scanned_quizzes
+
+    # unresolved entries from process_scan_file are one page each
+    unresolved_pages = []
+    for sq in unresolved:
+        if sq.pages:
+            unresolved_pages.extend(sq.pages)
+
+    # initialise capacity for each resolved group
+    capacities: Dict[str, int] = {}
+    quiz_pages: Dict[str, List[Any]] = {}
+    quiz_indices: Dict[str, List[int]] = {}
+    for sq in resolved:
+        info = expected_info.get(sq.quiz_id, {})
+        expected = info.get('expected_total_pages', 0) or len(sq.pages)
+        capacities[sq.quiz_id] = max(0, expected - len(sq.pages))
+        quiz_pages[sq.quiz_id] = list(sq.pages)
+        quiz_indices[sq.quiz_id] = [_scan_index(p) for p in sq.pages]
+
+    # assign each unresolved page to the nearest group that still needs pages
+    for page in sorted(unresolved_pages, key=_scan_index):
+        candidates = [
+            (qid, min(abs(_scan_index(page) - idx) for idx in quiz_indices[qid]) if quiz_indices[qid] else float('inf'))
+            for qid, cap in capacities.items() if cap > 0
+        ]
+        # prefer a group whose pages appear before this unresolved page
+        def _sort_key(item):
+            qid, dist = item
+            indices = quiz_indices[qid]
+            before = [idx for idx in indices if idx <= _scan_index(page)]
+            after = [idx for idx in indices if idx > _scan_index(page)]
+            # groups whose pages are before this page take priority; otherwise distance
+            has_before = 1 if not before else 0
+            return (has_before, dist)
+
+        candidates.sort(key=_sort_key)
+        if candidates:
+            chosen = candidates[0][0]
+            quiz_pages[chosen].append(page)
+            capacities[chosen] -= 1
+            quiz_indices[chosen].append(_scan_index(page))
+
+    # rebuild scanned_quizzes preserving resolved order and appending any
+    # still-unassigned unresolved pages at the end
+    new_quizzes = []
+    assigned_page_ids = set()
+    for sq in resolved:
+        sq.pages = quiz_pages[sq.quiz_id]
+        assigned_page_ids.update(id(p) for p in sq.pages)
+        new_quizzes.append(sq)
+
+    for sq in unresolved:
+        unassigned = [p for p in (sq.pages or []) if id(p) not in assigned_page_ids]
+        if unassigned:
+            new_quizzes.append(type(sq)(
+                quiz_id=sq.quiz_id,
+                student_code=sq.student_code,
+                pages=unassigned,
+                answers=sq.answers,
+                score=sq.score,
+            ))
+
+    return new_quizzes if new_quizzes else scanned_quizzes
+
+
+def _is_unknown_id(quiz_id: Optional[str]) -> bool:
+    return not quiz_id or quiz_id.startswith('unknown_')
+
+
+# ---------------------------------------------------------------------------
+# Main parsing
+# ---------------------------------------------------------------------------
+def parse_scan_file(
+    engine,
+    scan_path: str,
+    grading_dir: str,
+    course_folder: str,
+) -> List[GradingResult]:
     """Parse a single scan PDF into a list of GradingResult objects.
 
     Quiz identity (quiz_id, student_code) is read from the QR code on each
@@ -224,11 +405,40 @@ def parse_scan_file(engine, scan_path: str, grading_dir: str, course_folder: str
     `resolve_held_up_result`) - the calibration metadata can't be located
     without first knowing which quiz this is.
 
-    Scan-parsing routine used: quiz_scanner26.py:process_scan_file
+    When a quiz has a Quant/ODT component, the extra (non-QR) pages are
+    re-attributed to that quiz using the generated PDF's total page count,
+    and the indices of the Quant pages are stored on the result for later
+    extraction.
     """
-    process_scan_file, _, _ = _import_scanner()
+    process_scan_file, _, _, _ = _import_scanner()
     scanned_quizzes = process_scan_file(Path(scan_path))
     unresolved_dir = Path(grading_dir) / 'unresolved'
+
+    # Pre-load pagination and student information once per resolved quiz
+    expected_info: Dict[str, Dict[str, Any]] = {}
+    for sq in scanned_quizzes:
+        if _is_unknown_id(sq.quiz_id):
+            continue
+        quiz = get_quiz_by_id(engine, sq.quiz_id)
+        if not quiz:
+            continue
+        total = _get_generated_pdf_page_count(course_folder, sq.quiz_id)
+        mcq_pages = _get_mcq_page_count(course_folder, sq.quiz_id)
+        if total == 0:
+            total = mcq_pages
+        student = quiz.get('student') or {}
+        expected_info[sq.quiz_id] = {
+            'expected_total_pages': total,
+            'mcq_page_count': mcq_pages,
+            'has_odt': quiz.get('has_odt', False),
+            'section_number': student.get('section_number'),
+            'student_name': student.get('name', ''),
+            'student_code': student.get('student_code', ''),
+            'last_name': _last_name(student.get('name', '')),
+            'first_name': _first_name(student.get('name', '')),
+        }
+
+    scanned_quizzes = _reconcile_quant_pages(scanned_quizzes, expected_info)
 
     results = []
     for index, sq in enumerate(scanned_quizzes, 1):
@@ -252,6 +462,33 @@ def parse_scan_file(engine, scan_path: str, grading_dir: str, course_folder: str
             scan_file=str(scan_path),
         )
 
+        if not is_unresolved:
+            info = expected_info.get(sq.quiz_id, {})
+            result.has_quant = bool(info.get('has_odt'))
+            result.mcq_page_count = info.get('mcq_page_count', 0)
+            result.expected_total_pages = info.get('expected_total_pages', 0)
+            result.section_number = info.get('section_number')
+            result.student_name = info.get('student_name', '')
+            result.last_name = info.get('last_name', '')
+            result.first_name = info.get('first_name', '')
+            result.student_code = info.get('student_code') or sq.student_code
+
+            # Identify quant pages: pages beyond the MCQ section.  page_images
+            # is in printed order (MCQ pages sorted by QR page number, then
+            # any re-attached Quant pages appended).
+            if result.mcq_page_count and result.expected_total_pages > result.mcq_page_count:
+                for page in (sq.pages or []):
+                    page_num = getattr(page, 'quiz_page_number', None)
+                    # No QR page number (or page number > mcq count) is a
+                    # Quant/blank page.  Use the scan page_number as the
+                    # extraction index.
+                    if page_num is None or (
+                        isinstance(page_num, int) and page_num > result.mcq_page_count
+                    ):
+                        scan_idx = getattr(page, 'page_number', None)
+                        if scan_idx is not None:
+                            result.quant_scan_pages.append(scan_idx)
+
         if is_unresolved:
             result.held_up = True
             result.page_images = page_images
@@ -269,9 +506,12 @@ def parse_scan_file(engine, scan_path: str, grading_dir: str, course_folder: str
                 student_answers, issues = _read_answers_for_quiz_id(course_folder, sq.quiz_id, page_images)
                 result.student_answers = student_answers
                 result.validation_issues.extend(issues)
-                components, correct_answers = _score_against_database(engine, sq.quiz_id, student_answers)
+                components, correct_answers, questions = _score_against_database(
+                    engine, sq.quiz_id, student_answers, questions=result.quiz_questions or None,
+                )
                 result.components = components
                 result.correct_answers = correct_answers
+                result.quiz_questions = questions
             except ValueError as e:
                 result.held_up = True
                 result.page_images = page_images
@@ -279,6 +519,16 @@ def parse_scan_file(engine, scan_path: str, grading_dir: str, course_folder: str
 
         results.append(result)
     return results
+
+
+def _last_name(full_name: str) -> str:
+    parts = (full_name or '').strip().split()
+    return parts[-1].lower() if parts else ''
+
+
+def _first_name(full_name: str) -> str:
+    parts = (full_name or '').strip().split()
+    return parts[0].lower() if parts else ''
 
 
 def resolve_held_up_result(
@@ -305,7 +555,7 @@ def resolve_held_up_result(
 
     quiz_id = format_quiz_id(student_code, module_number, quiz_number)
     student_answers, issues = _read_answers_for_quiz_id(course_folder, quiz_id, result.page_images)
-    components, correct_answers = _score_against_database(engine, quiz_id, student_answers)
+    components, correct_answers, questions = _score_against_database(engine, quiz_id, student_answers)
 
     result.quiz_id = quiz_id
     result.student_code = student_code
@@ -314,6 +564,7 @@ def resolve_held_up_result(
     result.validation_issues.extend(issues)
     result.components = components
     result.correct_answers = correct_answers
+    result.quiz_questions = questions
     result.held_up = False
     result.page_images = []
     return result
@@ -324,7 +575,7 @@ def grade_block_scans(block_id: int, course_info: Optional[Dict] = None) -> List
 
     Routine used: quiz_scanner26.py:process_block_scans
     """
-    _, process_block_scans, _ = _import_scanner()
+    _, process_block_scans, _, _ = _import_scanner()
     scanned_quizzes = process_block_scans(block_id, course_info)
     # Reuse parse logic by converting ScannedQuiz objects.
     results = []
@@ -373,6 +624,87 @@ def _extract_module_number(quiz_id: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Blank-page detection
+# ---------------------------------------------------------------------------
+def _is_blank_page(image: np.ndarray, dark_threshold: int = 250, max_dark_fraction: float = 0.005) -> bool:
+    """Return True if *image* looks like a blank back page.
+
+    Blank backs inserted by the generator are essentially white with at most
+    a small page-number stamp.  Content pages contain enough text/diagrams
+    that they exceed the threshold.
+    """
+    if image is None:
+        return True
+    if len(image.shape) == 3:
+        gray = np.mean(image, axis=2).astype(np.uint8)
+    else:
+        gray = image
+    dark_fraction = np.mean(gray < dark_threshold)
+    return dark_fraction < max_dark_fraction
+
+
+# ---------------------------------------------------------------------------
+# Quant page extraction
+# ---------------------------------------------------------------------------
+def _extract_and_collate_quant_pages(
+    results: List[GradingResult],
+    scan_path: str,
+    grading_dir: str,
+    single_sides: bool = False,
+) -> List[str]:
+    """Extract Quant/ODT pages from the scan and collate them by section.
+
+    When *single_sides* is True, blank back pages are detected and ignored
+    (condition 4/5).  When False, both fronts and backs are kept (condition
+    3).  One combined PDF is written per section, ordered by last name.
+    """
+    if not scan_path or not os.path.isfile(scan_path):
+        return []
+
+    scan_path = Path(scan_path)
+    try:
+        from quiz_scanner26 import pdf_to_images
+        all_images = pdf_to_images(scan_path)
+    except Exception as e:
+        logger.warning(f'Could not render scan images for quant extraction: {e}')
+        return []
+
+    # group resolved results that have quant pages, by section
+    by_section: Dict[Optional[int], List[GradingResult]] = {}
+    for result in results:
+        if result.held_up or not result.quant_scan_pages:
+            continue
+        section = result.section_number if result.section_number is not None else 0
+        by_section.setdefault(section, []).append(result)
+
+    written: List[str] = []
+    for section, group in by_section.items():
+        group.sort(key=lambda r: (r.last_name or '', r.first_name or '', r.quiz_id or ''))
+
+        out_dir = Path(grading_dir) / 'extracted_quant' / f'section_{section}'
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / 'quant_pages.pdf'
+
+        writer = PdfWriter()
+        reader = PdfReader(str(scan_path))
+
+        for result in group:
+            for scan_idx in result.quant_scan_pages:
+                if scan_idx < 0 or scan_idx >= len(reader.pages):
+                    continue
+                if single_sides and scan_idx < len(all_images) and _is_blank_page(all_images[scan_idx]):
+                    continue
+                writer.add_page(reader.pages[scan_idx])
+
+        if writer.pages:
+            with open(out_path, 'wb') as f:
+                writer.write(f)
+            written.append(str(out_path))
+
+    return written
+
+
+# ---------------------------------------------------------------------------
 # Artifact persistence for regrade
 # ---------------------------------------------------------------------------
 def _parsed_quizzes_dir(grading_dir: str) -> Path:
@@ -409,6 +741,9 @@ def save_grading_artifacts(result: GradingResult, grading_dir: str) -> Path:
         'correct_answers': result.correct_answers,
         'validation_issues': result.validation_issues,
         'held_up': result.held_up,
+        'has_quant': result.has_quant,
+        'quant_scan_pages': result.quant_scan_pages,
+        'section_number': result.section_number,
         'timestamp': datetime.now().isoformat(),
     }
     with open(results_file, 'w') as f:
@@ -429,23 +764,82 @@ def load_grading_artifact(grading_dir: str, quiz_id: str) -> Optional[Dict[str, 
 # ---------------------------------------------------------------------------
 # Detailed feedback
 # ---------------------------------------------------------------------------
-def generate_detailed_feedback(engine, quiz_id: str, incorrect_questions: List[int]) -> str:
+def generate_detailed_feedback(
+    engine,
+    quiz_id: str,
+    incorrect_questions: List[int],
+    questions: Optional[List[Dict]] = None,
+) -> str:
     """Build detailed feedback text for incorrect questions.
 
     Feedback is read directly from the QuizQuestion rows saved in the
     database when the quiz was generated (database26.get_quiz_questions),
     keyed by question_number - no feedback text file needs to be located.
+
+    If *questions* is already provided it is reused, avoiding a second DB query.
     """
     if not incorrect_questions:
         return "No specific feedback available for your incorrect answers."
 
-    questions = {q['question_number']: q for q in get_quiz_questions(engine, quiz_id)}
+    if questions is None:
+        questions = {q['question_number']: q for q in get_quiz_questions(engine, quiz_id)}
+    else:
+        questions = {q['question_number']: q for q in questions}
 
     parts = ["\nDETAILED FEEDBACK:\n"]
     for q_num in sorted(incorrect_questions):
         feedback = (questions.get(q_num) or {}).get('feedback_text', '').strip()
         parts.append(f"Question {q_num}: {feedback or 'No specific feedback available for this question.'}")
     return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Draft email output (test mode)
+# ---------------------------------------------------------------------------
+def _write_draft_email(
+    engine,
+    result: GradingResult,
+    grading_dir: str,
+) -> None:
+    """Generate a feedback email and append it to a per-section text file."""
+    from email26 import generate_quiz_feedback_email
+
+    section = result.section_number if result.section_number is not None else 0
+    out_dir = Path(grading_dir) / 'draft_emails' / f'section_{section}'
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / 'draft_emails.txt'
+
+    incorrect = [
+        q for q, ans in result.student_answers.items()
+        if q in result.correct_answers and result.correct_answers[q] not in ans
+    ]
+    detailed = None
+    if incorrect:
+        try:
+            detailed = generate_detailed_feedback(engine, result.quiz_id, incorrect, questions=result.quiz_questions)
+        except Exception as e:
+            logger.warning(f"Could not generate detailed feedback: {e}")
+
+    try:
+        _subject, body, _context = generate_quiz_feedback_email(
+            student_code=result.student_code,
+            quiz_score=round(result.total_score),
+            module_number=result.module_number,
+            date_taken=datetime.now().strftime('%Y-%m-%d'),
+            detailed_feedback=detailed,
+            is_regrade=False,
+            engine=engine,
+        )
+    except Exception as e:
+        logger.warning(f"Could not generate draft email for {result.quiz_id}: {e}")
+        return
+
+    try:
+        with open(out_path, 'a', encoding='utf-8') as f:
+            f.write(body)
+            f.write('\n\n')
+    except Exception as e:
+        logger.warning(f"Could not write draft email to {out_path}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -504,14 +898,41 @@ def record_results(
     grading_session_id: Optional[int] = None,
     date_taken: Optional[str] = None,
     send_feedback: bool = False,
+    extract_quant: bool = False,
+    single_sides: bool = False,
+    scan_path: Optional[str] = None,
 ) -> List[Any]:
     """Save artifacts and record quiz attempts for all resolved results.
 
     Results still marked `held_up` are skipped - they must be resolved first
-    via `resolve_held_up_result`. Returns the list of recorded Quiz rows.
+    via `resolve_held_up_result`. Returns the list of recorded Quiz rows (or
+    GradingResult objects when TEST_MODE is active).
     """
-    recorded = []
-    for result in results:
+    recorded: List[Any] = []
+
+    # Process in section/last-name order so draft emails and extracted PDFs
+    # are naturally organized.
+    ordered = sorted(
+        results,
+        key=lambda r: (r.section_number if r.section_number is not None else 0,
+                       r.last_name or '', r.first_name or '', r.quiz_id or ''),
+    )
+
+    if TEST_MODE:
+        for result in ordered:
+            if result.held_up or result.overwrite_declined:
+                continue
+            save_grading_artifacts(result, grading_dir)
+            recorded.append(result)
+            if send_feedback:
+                _write_draft_email(engine, result, grading_dir)
+
+        if extract_quant and scan_path:
+            _extract_and_collate_quant_pages(ordered, scan_path, grading_dir, single_sides)
+
+        return recorded
+
+    for result in ordered:
         if result.held_up:
             logger.warning(f"Skipping unresolved scan (quiz {result.quiz_id}): {result.validation_issues}")
             continue
@@ -523,6 +944,10 @@ def record_results(
             recorded.append(quiz)
             if send_feedback:
                 _send_feedback_if_enabled(engine, result)
+
+    if extract_quant and scan_path:
+        _extract_and_collate_quant_pages(ordered, scan_path, grading_dir, single_sides)
+
     return recorded
 
 
@@ -534,6 +959,8 @@ def grade_and_record_scan_file(
     grading_session_id: Optional[int] = None,
     date_taken: Optional[str] = None,
     send_feedback: bool = False,
+    extract_quant: bool = False,
+    single_sides: bool = False,
 ) -> Tuple[List[Any], List[GradingResult]]:
     """Grade a scan file end-to-end and record everything that's resolvable.
 
@@ -550,14 +977,17 @@ def grade_and_record_scan_file(
         grading_session_id=grading_session_id,
         date_taken=date_taken,
         send_feedback=send_feedback,
+        extract_quant=extract_quant,
+        single_sides=single_sides,
+        scan_path=scan_path,
     )
     pending = [result for result in results if result.held_up]
     return recorded, pending
 
 
 def _send_feedback_if_enabled(engine, result: GradingResult) -> None:
-    """Queue/send feedback email if autosend is enabled."""
-    from email26 import generate_and_send_quiz_feedback
+    """Generate and queue a feedback email (never sent automatically)."""
+    from email26 import generate_and_queue_quiz_feedback
     incorrect = [
         q for q, ans in result.student_answers.items()
         if q in result.correct_answers and result.correct_answers[q] not in ans
@@ -565,11 +995,11 @@ def _send_feedback_if_enabled(engine, result: GradingResult) -> None:
     detailed = None
     if incorrect:
         try:
-            detailed = generate_detailed_feedback(engine, result.quiz_id, incorrect)
+            detailed = generate_detailed_feedback(engine, result.quiz_id, incorrect, questions=result.quiz_questions)
         except Exception as e:
             logger.warning(f"Could not generate detailed feedback: {e}")
 
-    generate_and_send_quiz_feedback(
+    generate_and_queue_quiz_feedback(
         student_code=result.student_code,
         quiz_score=round(result.total_score),
         module_number=result.module_number,

@@ -1422,6 +1422,33 @@ def get_quiz_score_by_quiz_id(engine: Engine, quiz_id: str) -> Optional[int]:
         return row.score if row else None
 
 
+def _quiz_to_dict(quiz: Quiz) -> Dict:
+    """Convert a Quiz ORM instance (and its attached student) to a plain dict."""
+    student = quiz.student
+    return {
+        'id': quiz.id,
+        'student_id': quiz.student_id,
+        'module_number': quiz.module_number,
+        'quiz_id': quiz.quiz_id,
+        'date_taken': quiz.date_taken or '',
+        'time_taken': quiz.time_taken or '',
+        'total_questions': quiz.total_questions,
+        'score': quiz.score,
+        'has_odt': bool(quiz.has_odt),
+        'odt_template_path': quiz.odt_template_path or '',
+        'odt_variable_names_json': quiz.odt_variable_names_json or '[]',
+        'odt_variable_values_json': quiz.odt_variable_values_json or '{}',
+        'student': _student_to_dict(student) if student else None,
+    }
+
+
+def get_quiz_by_id(engine: Engine, quiz_id: str) -> Optional[Dict]:
+    """Return the Quiz row for *quiz_id* as a plain dict, or None if missing."""
+    with Session(engine) as session:
+        quiz = session.query(Quiz).filter_by(quiz_id=quiz_id).first()
+        return _quiz_to_dict(quiz) if quiz else None
+
+
 def update_quiz_score(engine: Engine, quiz_id: int, new_score: Optional[int]) -> Optional[Quiz]:
     """Update a quiz score (used by manual regrade) and recompute progress.
 

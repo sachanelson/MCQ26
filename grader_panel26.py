@@ -12,7 +12,7 @@ from database26 import (
     get_course_info, get_quiz_score_by_quiz_id, get_section_meetings,
     get_section_meeting_grades, get_students_for_section, save_section_meeting_grade,
 )
-from grading26 import parse_scan_file, record_results, resolve_held_up_result
+from grading26 import parse_scan_file, record_results, resolve_held_up_result, TEST_MODE
 from grading_session26 import start_grading_session
 from unresolved_scan_dialog26 import UnresolvedScanDialog
 # from section_workspace26 import export_meeting_grades
@@ -43,8 +43,17 @@ class GraderPanel(QWidget):
         self.date_taken.setDisplayFormat('yyyy-MM-dd')
         form.addRow('Date Taken:', self.date_taken)
 
-        self.send_feedback = QCheckBox('Send quiz feedback emails')
+        self.send_feedback = QCheckBox('Generate feedback emails')
+        self.send_feedback.setChecked(True)
         form.addRow('', self.send_feedback)
+
+        self.extract_quant = QCheckBox('extract Quant')
+        self.extract_quant.setChecked(False)
+        form.addRow('', self.extract_quant)
+
+        self.single_sides = QCheckBox('single sides')
+        self.single_sides.setChecked(False)
+        form.addRow('', self.single_sides)
 
         grade_button = QPushButton('Grade Scan')
         grade_button.clicked.connect(self._grade_scan)
@@ -113,6 +122,9 @@ class GraderPanel(QWidget):
             QMessageBox.warning(self, 'Missing Course Folder', 'Set the course folder in Course Info first.')
             return
 
+        extract_quant = self.extract_quant.isChecked()
+        single_sides = self.single_sides.isChecked()
+
         try:
             session_info = start_grading_session(self.engine, course_folder, scan_path)
             grading_dir = str(session_info['directory'])
@@ -126,18 +138,39 @@ class GraderPanel(QWidget):
             if not result.held_up:
                 self._confirm_overwrite_if_needed(result)
 
+        # If Quant extraction was requested but no resolved quiz has a Quant
+        # component, inform the grader, uncheck the boxes, and continue with
+        # MCQ grading only.
+        if extract_quant:
+            resolved = [r for r in results if not r.held_up]
+            if not any(r.has_quant for r in resolved):
+                QMessageBox.information(
+                    self, 'No Quant Component',
+                    'No Quant/ODT component was found for any quiz in this scan. '
+                    'Quant extraction and single-sided options have been disabled.'
+                )
+                self.extract_quant.setChecked(False)
+                self.single_sides.setChecked(False)
+                extract_quant = False
+                single_sides = False
+
         to_record = [r for r in results if not r.held_up and not r.overwrite_declined]
         recorded = record_results(
             self.engine, to_record, grading_dir,
             grading_session_id=session_info['grading_session_id'],
             date_taken=self.date_taken.date().toString('yyyy-MM-dd'),
             send_feedback=self.send_feedback.isChecked(),
+            extract_quant=extract_quant,
+            single_sides=single_sides,
+            scan_path=session_info.get('scan_path') or scan_path,
         )
         self._show_results(results, recorded)
+        mode_note = ' [TEST MODE: no DB updates]' if TEST_MODE else ''
         self.status_label.setText(
             f"Grading session {session_info['session_date']}{session_info['letter']} "
             f"({grading_dir}): processed {len(results)} quiz result(s); "
             f'recorded {len(recorded)} quiz attempt(s) at {datetime.now().strftime("%H:%M:%S")}.'
+            f'{mode_note}'
         )
 
     def _resolve_if_needed(self, result, course_folder):
