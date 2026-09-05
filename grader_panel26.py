@@ -1,12 +1,15 @@
 from datetime import datetime
 import os
+from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox, QLabel,
     QLineEdit, QPushButton, QFileDialog, QDateEdit, QCheckBox, QComboBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, QDialog,
+    QRadioButton, QButtonGroup, QSpinBox,
 )
 from PyQt6.QtCore import QDate, Qt
+from PyQt6.QtGui import QColor
 
 from database26 import (
     get_course_info, get_quiz_score_by_quiz_id, get_section_meetings,
@@ -22,6 +25,7 @@ class GraderPanel(QWidget):
     def __init__(self, engine, parent=None):
         super().__init__(parent)
         self.engine = engine
+        self._displayed_results = []
         self._init_ui()
 
     def _init_ui(self):
@@ -37,10 +41,23 @@ class GraderPanel(QWidget):
         scan_row.addWidget(scan_browse)
         form.addRow('Scan PDF:', scan_row)
 
+        self.scan_mode_group = QButtonGroup(self)
+        self.one_pdf_radio = QRadioButton('One pdf')
+        self.all_in_folder_radio = QRadioButton('All in folder')
+        self.all_in_folder_radio.setChecked(True)
+        self.scan_mode_group.addButton(self.one_pdf_radio)
+        self.scan_mode_group.addButton(self.all_in_folder_radio)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(self.one_pdf_radio)
+        mode_row.addWidget(self.all_in_folder_radio)
+        mode_row.addStretch()
+        form.addRow('', mode_row)
+
         self.date_taken = QDateEdit()
         self.date_taken.setCalendarPopup(True)
         self.date_taken.setDate(QDate.currentDate())
         self.date_taken.setDisplayFormat('yyyy-MM-dd')
+        self.date_taken.setFixedWidth(115)
         form.addRow('Date Taken:', self.date_taken)
 
         self.send_feedback = QCheckBox('Generate feedback emails')
@@ -55,23 +72,58 @@ class GraderPanel(QWidget):
         self.single_sides.setChecked(False)
         form.addRow('', self.single_sides)
 
-        grade_button = QPushButton('Grade Scan')
+        grade_row = QHBoxLayout()
+        grade_button = QPushButton('Grade')
+        grade_button.setMaximumWidth(70)
         grade_button.clicked.connect(self._grade_scan)
-        form.addRow('', grade_button)
+        update_quant_button = QPushButton('Update Quant Scores')
+        update_quant_button.setMaximumWidth(130)
+        update_quant_button.clicked.connect(self._update_quant_scores)
+        grade_row.addWidget(grade_button)
+        grade_row.addWidget(update_quant_button)
+        grade_row.addStretch()
+        form.addRow('', grade_row)
+
+        quant_points_row = QHBoxLayout()
+        quant_points_row.addWidget(QLabel('Quant points per quiz:'))
+        self.max_quant_points_spin = QSpinBox()
+        self.max_quant_points_spin.setRange(0, 1000)
+        self.max_quant_points_spin.setValue(0)
+        self.max_quant_points_spin.setMaximumWidth(60)
+        quant_points_row.addWidget(self.max_quant_points_spin)
+        set_max_button = QPushButton('Set Max Quant Points')
+        set_max_button.setMaximumWidth(140)
+        set_max_button.clicked.connect(self._set_max_quant_points)
+        quant_points_row.addWidget(set_max_button)
+        quant_points_row.addStretch()
+        form.addRow('', quant_points_row)
+
         layout.addWidget(source_group)
 
         layout.addWidget(QLabel('Results'))
-        self.results_table = QTableWidget(0, 5)
+        self.results_table = QTableWidget(0, 8)
         self.results_table.setHorizontalHeaderLabels([
-            'Quiz ID', 'Student Code', 'Module', 'Score', 'Status',
+            'Quiz ID', 'Student Code', 'Module', 'MCQ Score', 'Quant Score',
+            'Max Quant Points', 'Total Score', 'Status',
         ])
-        self.results_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.results_table.setEditTriggers(QTableWidget.EditTrigger.AllEditTriggers)
         self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        header = self.results_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(True)
+        header.setDefaultSectionSize(70)
+        self.results_table.setColumnWidth(0, 120)
+        self.results_table.setColumnWidth(1, 90)
+        self.results_table.setColumnWidth(2, 50)
+        self.results_table.setColumnWidth(3, 60)
+        self.results_table.setColumnWidth(4, 60)
+        self.results_table.setColumnWidth(5, 80)
+        self.results_table.setColumnWidth(6, 60)
         layout.addWidget(self.results_table)
         self.status_label = QLabel(
-            'Select a scan PDF and click Grade Scan. A grading session folder is created '
-            'automatically under <course_folder>/grading/<date>/<date><letter>/.'
+            'Select one scan PDF or a folder of scan PDFs and click Grade. '
+            'A grading session folder is created automatically under '
+            '<course_folder>/grading/<date>/<date><letter>/.'
         )
         layout.addWidget(self.status_label)
 
@@ -105,18 +157,41 @@ class GraderPanel(QWidget):
 
     def _browse_scan(self):
         start = self._course_folder()
-        path, _ = QFileDialog.getOpenFileName(self, 'Select Scan PDF', start, 'PDF Files (*.pdf)')
-        if path:
-            self.scan_path.setText(path)
+        if self.one_pdf_radio.isChecked():
+            path, _ = QFileDialog.getOpenFileName(self, 'Select Scan PDF', start, 'PDF Files (*.pdf)')
+            if path:
+                self.scan_path.setText(path)
+        else:
+            path = QFileDialog.getExistingDirectory(self, 'Select Scan Folder', start)
+            if path:
+                self.scan_path.setText(path)
 
     def _course_folder(self):
         return get_course_info(self.engine).get('course_folder', '') or os.path.expanduser('~')
 
     def _grade_scan(self):
-        scan_path = self.scan_path.text().strip()
-        if not scan_path or not os.path.isfile(scan_path):
-            QMessageBox.warning(self, 'Missing Scan', 'Select an existing scan PDF.')
+        scan_input = self.scan_path.text().strip()
+        if not scan_input:
+            QMessageBox.warning(self, 'Missing Scan', 'Select a scan PDF or folder.')
             return
+
+        if self.one_pdf_radio.isChecked():
+            scan_files = [scan_input] if os.path.isfile(scan_input) else []
+            if not scan_files:
+                QMessageBox.warning(self, 'Missing Scan', 'Select an existing scan PDF.')
+                return
+        else:
+            if not os.path.isdir(scan_input):
+                QMessageBox.warning(self, 'Missing Folder', 'Select an existing folder of scan PDFs.')
+                return
+            scan_files = sorted(
+                str(p) for p in Path(scan_input).rglob('*')
+                if p.is_file() and p.suffix.lower() == '.pdf'
+            )
+            if not scan_files:
+                QMessageBox.warning(self, 'No PDFs', 'No PDF files found in the selected folder.')
+                return
+
         course_folder = self._course_folder()
         if not course_folder or not os.path.isdir(course_folder):
             QMessageBox.warning(self, 'Missing Course Folder', 'Set the course folder in Course Info first.')
@@ -125,34 +200,46 @@ class GraderPanel(QWidget):
         extract_quant = self.extract_quant.isChecked()
         single_sides = self.single_sides.isChecked()
 
-        try:
-            session_info = start_grading_session(self.engine, course_folder, scan_path)
-            grading_dir = str(session_info['directory'])
-            results = parse_scan_file(self.engine, scan_path, grading_dir, course_folder)
-        except Exception as error:
-            QMessageBox.critical(self, 'Could Not Grade Scan', str(error))
-            return
+        all_results = []
+        all_recorded = []
+        processed_count = 0
+        for scan_path in scan_files:
+            try:
+                results, recorded = self._process_one_scan(scan_path, course_folder, extract_quant, single_sides)
+                all_results.extend(results)
+                all_recorded.extend(recorded)
+                processed_count += 1
+            except Exception as error:
+                QMessageBox.critical(self, 'Could Not Grade Scan', f'{scan_path}:\n{error}')
+
+        if extract_quant and all_results:
+            resolved = [r for r in all_results if not r.held_up]
+            if not any(r.has_quant for r in resolved):
+                QMessageBox.information(
+                    self, 'No Quant Component',
+                    'No Quant/ODT component was found for any quiz in this batch. '
+                    'Quant extraction and single-sided options have been disabled.'
+                )
+                self.extract_quant.setChecked(False)
+                self.single_sides.setChecked(False)
+
+        self._show_results(all_results, all_recorded)
+        mode_note = ' [TEST MODE: no DB updates]' if TEST_MODE else ''
+        self.status_label.setText(
+            f'Processed {len(all_results)} quiz result(s) from {processed_count} scan(s); '
+            f'recorded {len(all_recorded)} quiz attempt(s) at {datetime.now().strftime("%H:%M:%S")}.'
+            f'{mode_note}'
+        )
+
+    def _process_one_scan(self, scan_path, course_folder, extract_quant, single_sides):
+        session_info = start_grading_session(self.engine, course_folder, scan_path)
+        grading_dir = str(session_info['directory'])
+        results = parse_scan_file(self.engine, scan_path, grading_dir, course_folder)
 
         for result in results:
             self._resolve_if_needed(result, course_folder)
             if not result.held_up:
                 self._confirm_overwrite_if_needed(result)
-
-        # If Quant extraction was requested but no resolved quiz has a Quant
-        # component, inform the grader, uncheck the boxes, and continue with
-        # MCQ grading only.
-        if extract_quant:
-            resolved = [r for r in results if not r.held_up]
-            if not any(r.has_quant for r in resolved):
-                QMessageBox.information(
-                    self, 'No Quant Component',
-                    'No Quant/ODT component was found for any quiz in this scan. '
-                    'Quant extraction and single-sided options have been disabled.'
-                )
-                self.extract_quant.setChecked(False)
-                self.single_sides.setChecked(False)
-                extract_quant = False
-                single_sides = False
 
         to_record = [r for r in results if not r.held_up and not r.overwrite_declined]
         recorded = record_results(
@@ -164,14 +251,7 @@ class GraderPanel(QWidget):
             single_sides=single_sides,
             scan_path=session_info.get('scan_path') or scan_path,
         )
-        self._show_results(results, recorded)
-        mode_note = ' [TEST MODE: no DB updates]' if TEST_MODE else ''
-        self.status_label.setText(
-            f"Grading session {session_info['session_date']}{session_info['letter']} "
-            f"({grading_dir}): processed {len(results)} quiz result(s); "
-            f'recorded {len(recorded)} quiz attempt(s) at {datetime.now().strftime("%H:%M:%S")}.'
-            f'{mode_note}'
-        )
+        return results, recorded
 
     def _resolve_if_needed(self, result, course_folder):
         """Prompt the grader to identify a scan whose QR code could not be read.
@@ -216,6 +296,7 @@ class GraderPanel(QWidget):
             result.overwrite_declined = True
 
     def _show_results(self, results, recorded):
+        self._displayed_results = list(results)
         recorded_ids = {getattr(quiz, 'quiz_id', '') for quiz in recorded}
         self.results_table.setRowCount(len(results))
         for row, result in enumerate(results):
@@ -224,18 +305,100 @@ class GraderPanel(QWidget):
                 status = 'Unresolved'
             elif result.overwrite_declined:
                 status = 'Skipped (not overwritten)'
+
+            mcq_score = result.mcq_score
+            mcq_text = f'{mcq_score:.0f}' if mcq_score is not None else ''
+            total_text = mcq_text
+
+            quiz_id_item = QTableWidgetItem(result.quiz_id)
+            student_code_item = QTableWidgetItem(result.student_code or '')
+            module_item = QTableWidgetItem(str(result.module_number))
+            mcq_score_item = QTableWidgetItem(mcq_text)
+            quant_score_item = QTableWidgetItem('0' if result.has_quant else '-')
+            max_quant_item = QTableWidgetItem('0' if result.has_quant else '-')
+            total_score_item = QTableWidgetItem(total_text)
+            status_item = QTableWidgetItem(status)
+
+            # Make sure most cells are not editable
+            for item in (quiz_id_item, student_code_item, module_item,
+                         mcq_score_item, total_score_item, status_item):
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+            if not result.has_quant:
+                gray = QColor('lightgray')
+                for item in (quant_score_item, max_quant_item):
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    item.setBackground(gray)
+                    item.setForeground(QColor('gray'))
+            else:
+                quant_score_item.setData(Qt.ItemDataRole.UserRole, 0)
+                max_quant_item.setData(Qt.ItemDataRole.UserRole, 0)
+
+            if result.validation_issues:
+                status_item.setToolTip('\n'.join(result.validation_issues))
+
             values = [
-                result.quiz_id,
-                result.student_code or '',
-                str(result.module_number),
-                f'{result.total_score:.0f}',
-                status,
+                quiz_id_item,
+                student_code_item,
+                module_item,
+                mcq_score_item,
+                quant_score_item,
+                max_quant_item,
+                total_score_item,
+                status_item,
             ]
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if column == 4 and result.validation_issues:
-                    item.setToolTip('\n'.join(result.validation_issues))
+            for column, item in enumerate(values):
                 self.results_table.setItem(row, column, item)
+
+    def _update_quant_scores(self):
+        for row in range(self.results_table.rowCount()):
+            if row >= len(self._displayed_results):
+                continue
+            result = self._displayed_results[row]
+            if not result.has_quant:
+                continue
+
+            mcq_component = next((c for c in result.components if c.component_type == 'mcq'), None)
+            if mcq_component is None:
+                continue
+            mcq_correct = mcq_component.correct
+            mcq_total = mcq_component.total
+
+            quant_item = self.results_table.item(row, 4)
+            max_item = self.results_table.item(row, 5)
+            if quant_item is None or max_item is None:
+                continue
+
+            try:
+                quant_achieved = int(quant_item.text().strip() or '0')
+            except ValueError:
+                quant_achieved = 0
+            try:
+                quant_max = int(max_item.text().strip() or '0')
+            except ValueError:
+                quant_max = 0
+
+            if quant_max <= 0:
+                total_pct = result.total_score
+            else:
+                total_pct = 100.0 * (mcq_correct + quant_achieved) / (mcq_total + quant_max)
+
+            total_item = self.results_table.item(row, 6)
+            if total_item is not None:
+                total_item.setText(f'{round(total_pct)}')
+
+    def _set_max_quant_points(self):
+        value = self.max_quant_points_spin.value()
+        for row in range(self.results_table.rowCount()):
+            if row >= len(self._displayed_results):
+                continue
+            result = self._displayed_results[row]
+            if not result.has_quant:
+                continue
+            item = self.results_table.item(row, 5)
+            if item is not None:
+                item.setText(str(value))
+                item.setData(Qt.ItemDataRole.UserRole, value)
 
     def _refresh_section_meeting_grades(self):
         current_id = self.section_meeting_combo.currentData()
@@ -275,7 +438,7 @@ class GraderPanel(QWidget):
                 student.student_code,
                 student.name,
                 grade.get('worksheet_id', ''),
-                '' if grade.get('score') is None else str(grade['score']),
+                '' if grade.get('score') is None else str(grade.get('score')),
                 grade.get('attendance_status', ''),
                 grade.get('note', ''),
             ]
