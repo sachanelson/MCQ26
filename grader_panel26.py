@@ -22,13 +22,15 @@ from database26 import (
 )
 from grading26 import (
     ComponentScore, GradingResult, build_replacement_packet, parse_scan_file,
+    is_spare_student_code, needs_transfer_review,
     record_grading_result, record_results, rescore_result, resolve_held_up_result,
     save_grading_artifacts,
     _send_feedback_if_enabled, _queue_test_feedback_email, _write_replacement_list, TEST_MODE,
 )
 from grading_session26 import start_grading_session
 from unresolved_scan_dialog26 import (
-    BlankPageDialog, MissingAnswerDialog, MultipleMarkDialog, UnresolvedScanDialog,
+    BlankPageDialog, MissingAnswerDialog, MultipleMarkDialog, TransferPromptDialog,
+    UnresolvedScanDialog,
 )
 from regrade_dialog26 import QuizSelectionDialog, RegradeDialog
 
@@ -454,27 +456,32 @@ class GraderPanel(QWidget):
     def _prompt_transfer_if_unenrolled(self, result):
         """Offer to transfer a quiz whose owner is not a currently enrolled student.
 
-        Quizzes printed for TAs, departed students, or spare codes are
-        sometimes taken by someone else; catching that here - after the scan
-        is identified but before the result is graded and recorded under the
-        printed owner - avoids a manual transfer afterwards.
+        Quizzes printed for TAs, departed students, or spare codes such as
+        'SaQ' (Sample Questions) are sometimes taken by someone else;
+        catching that here - after the scan is identified but before the
+        result is graded and recorded under the printed owner - avoids a
+        manual transfer afterwards.  The quiz's first page is shown so the
+        grader can read the name the student wrote.
         """
-        if not result.student_code:
+        if not needs_transfer_review(self.engine, result.student_code):
             return
         student = get_student_by_code(self.engine, result.student_code)
-        if student is not None and student.enrolled:
-            return
 
         owner = result.student_name or (student.name if student else '') or result.student_code
-        answer = QMessageBox.question(
-            self, 'Quiz Owner Not Enrolled',
+        reason = (
+            'which is a spare (Sample Questions) quiz.'
+            if is_spare_student_code(result.student_code)
+            else 'who is not a currently enrolled student.'
+        )
+        dialog = TransferPromptDialog(
+            result.first_page_image_path or result.unresolved_image_path,
             f'Quiz {result.quiz_id} is associated with\n'
             f'  {owner} ({result.student_code})\n'
-            'who is not a currently enrolled student.\n\n'
+            f'{reason}\n\n'
             'Transfer this quiz to a different student?',
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            self,
         )
-        if answer != QMessageBox.StandardButton.Yes:
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
         new_student = self._prompt_for_student(result)

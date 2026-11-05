@@ -120,6 +120,43 @@ class BlankPageDialog(QDialog):
         layout.addWidget(buttons)
 
 
+class TransferPromptDialog(QDialog):
+    """Ask whether to transfer a quiz printed for a spare or non-enrolled owner.
+
+    Shows the quiz's first scanned page so the grader can read the name the
+    student actually wrote.  Accepted means 'transfer this quiz'.
+    """
+
+    def __init__(self, image_path: Optional[str], message: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Transfer Quiz?')
+        self.resize(760, 800)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(message))
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        image_label = QLabel()
+        image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pixmap = QPixmap(image_path) if image_path else None
+        if pixmap and not pixmap.isNull():
+            image_label.setPixmap(pixmap.scaledToWidth(720, Qt.TransformationMode.SmoothTransformation))
+        else:
+            image_label.setText('(No scanned page image available.)')
+        scroll.setWidget(image_label)
+        scroll.setMinimumHeight(500)
+        layout.addWidget(scroll)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Yes | QDialogButtonBox.StandardButton.No
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Yes).setText('Transfer…')
+        buttons.button(QDialogButtonBox.StandardButton.No).setText('Keep As Is')
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
 class MultipleMarkDialog(QDialog):
     def __init__(
         self, image_path: Optional[str], quiz_id: str, question_number: int,

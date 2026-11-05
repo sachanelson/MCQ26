@@ -82,6 +82,50 @@ def _ensure_zbar_library_path() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Transfer review
+# ---------------------------------------------------------------------------
+# Codes of placeholder 'students' whose printed quizzes are spares handed to
+# someone else (e.g. 'SaQ' = "Sample Questions"). During grading these are
+# treated like quizzes of non-enrolled students: the grader is asked whether
+# to transfer the quiz to the student who actually took it.
+SPARE_STUDENT_CODES = {'saq'}
+
+
+def is_spare_student_code(student_code: Optional[str]) -> bool:
+    return (student_code or '').strip().lower() in SPARE_STUDENT_CODES
+
+
+def needs_transfer_review(engine, student_code: Optional[str]) -> bool:
+    """True if a quiz printed for *student_code* should prompt a transfer."""
+    if not student_code:
+        return False
+    if is_spare_student_code(student_code):
+        return True
+    student = get_student_by_code(engine, student_code)
+    return student is None or not student.enrolled
+
+
+def _save_first_page_image(pages, page_images, grading_dir, quiz_id) -> Optional[str]:
+    """Save the quiz's printed page 1 (or its first scanned page) as a PNG."""
+    if not page_images:
+        return None
+    index = next(
+        (i for i, page in enumerate(pages or [])
+         if getattr(page, 'quiz_page_number', None) == 1 and i < len(page_images)),
+        0,
+    )
+    output_dir = Path(grading_dir) / 'transfer_review'
+    output_dir.mkdir(parents=True, exist_ok=True)
+    image_path = output_dir / f'{quiz_id}_page_1.png'
+    try:
+        Image.fromarray(page_images[index]).save(image_path)
+    except Exception as e:
+        logger.warning(f'Could not save first-page image for {quiz_id}: {e}')
+        return None
+    return str(image_path)
+
+
+# ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
 @dataclass
@@ -110,6 +154,9 @@ class GradingResult:
     grading_session_id: Optional[int] = None
     date_taken: Optional[str] = None
     unresolved_image_path: Optional[str] = None
+    # Saved image of the quiz's first page, written only for quizzes that
+    # need a transfer review (see needs_transfer_review).
+    first_page_image_path: Optional[str] = None
     ambiguous_image_paths: Dict[int, str] = field(default_factory=dict)
     missing_image_paths: Dict[int, str] = field(default_factory=dict)
     overwrite_declined: bool = False
@@ -773,6 +820,7 @@ def parse_scan_file(
             })
             if getattr(page, 'image', None) is not None:
                 page_images.append(page.image)
+        image_pages = [p for p in (sq.pages or []) if getattr(p, 'image', None) is not None]
 
         is_unresolved = not sq.quiz_id or sq.quiz_id.startswith('unknown_') or not sq.student_code
 
@@ -808,6 +856,10 @@ def parse_scan_file(
             # Quant pages were already separated out and their original scan
             # indices are stored for later collation.
             result.quant_scan_pages = list(quant_scan_pages_by_quiz.get(sq.quiz_id, []))
+
+            if needs_transfer_review(engine, result.student_code):
+                result.first_page_image_path = _save_first_page_image(
+                    image_pages, page_images, grading_dir, sq.quiz_id)
 
         if is_unresolved:
             result.held_up = True
