@@ -77,7 +77,7 @@ import re
 import random
 import itertools
 from typing import Dict, List, Optional, Tuple, Any, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from copy import deepcopy
 
@@ -154,6 +154,7 @@ class ProblemDefinition:
     equations: List[Equation]
     variables: Dict[str, VariableDef]   # keyed by $var name
     constants: Dict[str, ConstantDef]   # keyed by #sym name
+    feedback: Dict[str, str] = field(default_factory=dict)  # keyed by question number str or "All"
 
 
 @dataclass
@@ -452,6 +453,7 @@ class ProblemDefinitionParser:
     EQUATION_SECTION = 'EQUATIONS'
     VARIABLE_SECTION = 'VARIABLES'
     CONSTANT_SECTION = 'CONSTANTS'
+    FEEDBACK_SECTION = 'FEEDBACK'
 
     @classmethod
     def parse_file(cls, filepath: str) -> ProblemDefinition:
@@ -491,6 +493,7 @@ class ProblemDefinitionParser:
         eq_lines = []
         var_lines = []
         const_lines = []
+        feedback_lines = []
         current_section = None
 
         for line in lines:
@@ -506,6 +509,9 @@ class ProblemDefinitionParser:
             elif stripped.upper().startswith('[CONSTANTS]') or stripped.upper() == 'CONSTANTS:':
                 current_section = cls.CONSTANT_SECTION
                 continue
+            elif stripped.upper().startswith('[FEEDBACK]') or stripped.upper() == 'FEEDBACK:':
+                current_section = cls.FEEDBACK_SECTION
+                continue
 
             # Skip empty lines and pure comment lines
             if not stripped or (stripped.startswith('#') and current_section != cls.CONSTANT_SECTION):
@@ -517,6 +523,8 @@ class ProblemDefinitionParser:
                 var_lines.append(stripped)
             elif current_section == cls.CONSTANT_SECTION:
                 const_lines.append(stripped)
+            elif current_section == cls.FEEDBACK_SECTION:
+                feedback_lines.append(stripped)
             else:
                 # Auto-detect: lines with $ and = are equations
                 if '=' in stripped and '$' in stripped:
@@ -531,12 +539,35 @@ class ProblemDefinitionParser:
 
         variables = VariableTableParser.parse(var_lines)
         constants = ConstantsTableParser.parse(const_lines)
+        feedback = cls._parse_feedback(feedback_lines)
 
         return ProblemDefinition(
             equations=[],
             variables=variables,
             constants=constants,
+            feedback=feedback,
         )
+
+    @classmethod
+    def _parse_feedback(cls, lines: List[str]) -> Dict[str, str]:
+        """Parse [FEEDBACK] lines into a dict keyed by question number or 'All'.
+
+        Expected formats:
+            All: Review Nernst Equation problems
+            1: Review Nernst Equation problems
+            2: Review Tau = RC
+        """
+        feedback: Dict[str, str] = {}
+        for line in lines:
+            if ':' not in line:
+                continue
+            key, _, text = line.partition(':')
+            key = key.strip()
+            text = text.strip()
+            if not key or not text:
+                continue
+            feedback[key] = text
+        return feedback
 
 
 # ---------------------------------------------------------------------------
@@ -772,6 +803,33 @@ class PlotGenerator:
 _PLACEHOLDER_RE = re.compile(r'\{\{(answer|graph)(?:_(\d+[A-Za-z]*))?(?:\s*;\s*([^}]+))?\}\}', re.IGNORECASE)
 
 
+def answer_template_total_points(template_path: str) -> float:
+    import zipfile
+    from lxml import etree
+
+    with zipfile.ZipFile(template_path, 'r') as archive:
+        content = archive.read('content.xml')
+    root = etree.fromstring(content)
+    draw_ns = 'urn:oasis:names:tc:opendocument:xmlns:drawing:1.0'
+    totals = {}
+    for frame in root.iter(f'{{{draw_ns}}}frame'):
+        text = ''.join(frame.itertext())
+        match = _PLACEHOLDER_RE.search(text)
+        if not match or match.group(1).lower() != 'answer' or not match.group(3):
+            continue
+        answer_id = (match.group(2) or '').lower()
+        try:
+            points = float(match.group(3).strip())
+        except ValueError as error:
+            raise ValueError(f'Invalid point value in {match.group(0)}') from error
+        if points < 0:
+            raise ValueError(f'Point value cannot be negative in {match.group(0)}')
+        if answer_id in totals:
+            raise ValueError(f'Duplicate answer point declaration for answer_{answer_id}')
+        totals[answer_id] = points
+    return sum(totals.values())
+
+
 class TemplateProcessor:
     """Copies an ODT template and substitutes both:
 
@@ -861,6 +919,7 @@ class TemplateProcessor:
                 self._inject_header(root, ns, metadata, student_code, student_name, section_code)
                 self._ensure_header(styles_tree, section_code, student_name, metadata)
                 self._ensure_footer(styles_tree, metadata=metadata)
+                self._set_letter_page_size(styles_tree)
                 self._reduce_page_margins_for_signature(styles_tree)
                 if styles_tree is not None:
                     styles_tree.write(styles_xml, xml_declaration=True,
@@ -880,6 +939,7 @@ class TemplateProcessor:
             # Replace $Variable tokens in body text and tables
             if problems:
                 self._substitute_variables(root, problems, definition, ns)
+            self._evaluate_inline_expressions(root, ns)
 
             # Process all draw:frame elements
             for frame in root.iter(f"{{{ns['draw']}}}frame"):
@@ -1152,18 +1212,37 @@ class TemplateProcessor:
         p.set(f'{{{ns_text}}}style-name', 'OneUnRunningHeader')
 
         quiz_date = metadata.get('quiz_date', '')
+        module_number = metadata.get('module_number')
+        worksheet_prefix = (
+            f"Worksheet\xa0{module_number}  "
+            if metadata.get('doc_type') == 'Worksheet' and module_number is not None
+            else ''
+        )
         if section_code:
             header_text = (
-                f"Student:\xa0{student_name}, "
+                f"{worksheet_prefix}Student:\xa0{student_name}, "
                 f"Section:\xa0{section_code}, "
                 f"created:\xa0{quiz_date}"
             )
         else:
             header_text = (
-                f"Student:\xa0{student_name}, "
+                f"{worksheet_prefix}Student:\xa0{student_name}, "
                 f"created:\xa0{quiz_date}"
             )
         p.text = header_text.replace(' ', '\xa0')
+
+    def _set_letter_page_size(self, styles_tree) -> None:
+        """Set every ODT page layout to portrait US Letter."""
+        if styles_tree is None:
+            return
+        ns_s = self._NS_STYLE
+        ns_fo = self._NS_FO
+
+        root = styles_tree.getroot()
+        for props in root.iter(f'{{{ns_s}}}page-layout-properties'):
+            props.set(f'{{{ns_fo}}}page-width', '8.5in')
+            props.set(f'{{{ns_fo}}}page-height', '11in')
+            props.set(f'{{{ns_s}}}print-orientation', 'portrait')
 
     def _reduce_page_margins_for_signature(self, styles_tree) -> None:
         """Shrink top/bottom page margins so the prepended signature line fits
@@ -1284,6 +1363,69 @@ class TemplateProcessor:
             if elem.tail and '#' in elem.tail:
                 elem.tail = _replace(elem.tail)
 
+    @classmethod
+    def _evaluate_inline_expressions(cls, root, ns: Dict):
+        expression_re = re.compile(r'(?<![A-Za-z0-9_)\]])=(?=[0-9(+\-]*[0-9])([0-9(+\-][0-9eE+\-*/%(). \t]*)')
+        text_ns = ns.get('text', 'urn:oasis:names:tc:opendocument:xmlns:text:1.0')
+
+        def walk(elem, include_tail=True):
+            if elem.text is not None:
+                yield elem, 'text', elem.text
+            for child in elem:
+                yield from walk(child, True)
+            if include_tail and elem.tail is not None:
+                yield elem, 'tail', elem.tail
+
+        for block in list(root.iter(f'{{{text_ns}}}p', f'{{{text_ns}}}h')):
+            search_from = 0
+            while True:
+                segments = list(walk(block, include_tail=False))
+                full = ''.join(text for _, _, text in segments)
+                match = expression_re.search(full, search_from)
+                if match is None:
+                    break
+                expression = match.group(1)
+                trailing_space = expression[len(expression.rstrip()):]
+                try:
+                    value = cls._evaluate_answer_expression(expression.rstrip())
+                except ValueError:
+                    print(f"OneUn template warning: skipped invalid inline "
+                          f"expression '={expression.strip()}'")
+                    search_from = match.start() + 1
+                    continue
+                replacement = value + trailing_space
+                starts = []
+                pos = 0
+                for _, _, text in segments:
+                    starts.append(pos)
+                    pos += len(text)
+                start_index = end_index = None
+                start_offset = end_offset = 0
+                for index, start in enumerate(starts):
+                    segment_end = start + len(segments[index][2])
+                    if start_index is None and start <= match.start() < segment_end:
+                        start_index = index
+                        start_offset = match.start() - start
+                    if end_index is None and start < match.end() <= segment_end:
+                        end_index = index
+                        end_offset = match.end() - start
+                        break
+                if start_index is None or end_index is None:
+                    break
+                first_elem, first_attr, first_text = segments[start_index]
+                last_elem, last_attr, last_text = segments[end_index]
+                prefix = first_text[:start_offset]
+                suffix = last_text[end_offset:]
+                setattr(first_elem, first_attr, prefix + replacement)
+                for index in range(start_index + 1, end_index):
+                    elem, attr, _ = segments[index]
+                    setattr(elem, attr, '')
+                if start_index == end_index:
+                    setattr(first_elem, first_attr, prefix + replacement + suffix)
+                else:
+                    setattr(last_elem, last_attr, suffix)
+                search_from = match.start() + len(replacement)
+
     def _substitute_variables(self, root, problems: List[Problem],
                               definition: ProblemDefinition, ns: Dict):
         """Replace $VarName tokens in text nodes with generated values."""
@@ -1402,6 +1544,10 @@ class TemplateProcessor:
         if len(answer_lines) > 2:
             raise ValueError('An answer-key frame may contain at most two answer lines after its {{answer...}} name.')
         rendered = [cls._render_answer_line(line) for line in answer_lines]
+        placeholder = _PLACEHOLDER_RE.match(lines[0])
+        points = placeholder.group(3).strip() if placeholder and placeholder.group(3) else ''
+        if points:
+            rendered.extend(['', f'{points} points'])
         cls._set_frame_text(frame, ns, rendered)
 
     @staticmethod
@@ -1504,6 +1650,7 @@ class OneUnODTGenerator:
                       start_question: Optional[int] = None,
                       start_page: Optional[int] = None,
                       attempts: int = 1,
+                      fixed_values: Optional[Dict[str, Any]] = None,
                       return_values: bool = False) -> Union[List[str], Tuple[List[str], List[str], Dict[str, List[Dict]]]]:
         """Generate ODT quiz files per student and attempt, and write a summary log.
 
@@ -1533,6 +1680,11 @@ class OneUnODTGenerator:
                        incremented seed so no two attempts for the same
                        student use the same random state.
             attempts: Number of quiz variants to generate per student.
+            fixed_values: Optional dict of variable values to use instead of
+                          drawing new random values. Intended for regenerating
+                          a quiz with the same values (e.g., for corrected
+                          replacement pages). When provided, a single
+                          Problem is built from these values.
             return_values: If True, also return a mapping of student code to
                            a list of the drawn variable value dicts (one per attempt).
 
@@ -1594,8 +1746,13 @@ class OneUnODTGenerator:
                 attempt_seed = (student_seed + (attempt - 1)
                                 if student_seed is not None else None)
 
-                # Generate the Problem (one value per variable) for this attempt
-                problems = generator.generate_for_student(seed=attempt_seed)
+                # Generate the Problem (one value per variable) for this attempt.
+                # If fixed_values is supplied, use it directly (intended for
+                # regenerating an already-printed quiz with the same numbers).
+                if fixed_values is not None:
+                    problems = [Problem(given_values=dict(fixed_values), equation_index=1)]
+                else:
+                    problems = generator.generate_for_student(seed=attempt_seed)
                 odt_values.setdefault(student_code or f'generic_{idx}', []).append(
                     dict(problems[0].given_values)
                 )

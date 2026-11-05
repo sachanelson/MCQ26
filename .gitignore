@@ -22,10 +22,9 @@ db26/*.db-journal
 *.sqlite
 *.sqlite3
 
-# OAuth / email credentials and autosend config
+# OAuth / email credentials
 token.json
 credentials.json
-email_autosend.json
 
 # Test modules
 simple_test_quiz.py

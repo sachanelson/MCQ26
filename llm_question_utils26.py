@@ -263,6 +263,7 @@ def get_header_from_file(file_path):
                 
             # Join header lines and evaluate as dictionary
             header_str = '\n'.join(header_lines)
+            
             try:
                 return eval(header_str)
             except (SyntaxError, NameError, TypeError):

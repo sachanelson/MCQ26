@@ -3,14 +3,17 @@ Course Info Panel - A reusable component for managing course information.
 """
 from datetime import datetime
 from pathlib import Path
+from collections import Counter
 import json
+import shutil
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QFormLayout, QScrollArea,
     QLineEdit, QLabel, QPushButton, QDialog, QDialogButtonBox,
     QMessageBox, QTableWidget, QTableWidgetItem, QListWidget, QListWidgetItem,
-    QHeaderView, QFileDialog, QHBoxLayout, QSpinBox, QTextEdit, QComboBox
+    QHeaderView, QFileDialog, QHBoxLayout, QSpinBox, QTextEdit, QComboBox,
+    QInputDialog
 )
-from PyQt6.QtCore import Qt, QUrl
+from PyQt6.QtCore import Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -21,6 +24,8 @@ from database26 import (
     get_all_classrooms, save_classroom, delete_classroom,
     get_section_meetings, save_section_meeting,
     get_all_students, save_enrolled_students,
+    get_lecture_meetings, generate_lecture_meetings,
+    student_name_sort_key,
 )
 # Legacy module status text files deprecated; no import needed
 
@@ -33,13 +38,14 @@ class EnrolledStudentsDialog(QDialog):
         self.setWindowTitle('Manage Enrolled Students')
         self.resize(700, 480)
         layout = QVBoxLayout(self)
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(['Name', 'Code', 'Section'])
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(['Name', 'Code', 'Section', 'Email'])
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.table)
         buttons = QHBoxLayout()
         add_button = QPushButton('Add Student')
@@ -61,11 +67,7 @@ class EnrolledStudentsDialog(QDialog):
     def _load_students(self):
         self.table.setRowCount(0)
 
-        def _second_name_key(name):
-            parts = (name or '').strip().split()
-            return parts[1].casefold() if len(parts) >= 2 else (parts[0] if parts else '').casefold()
-
-        for student in sorted(get_all_students(self.engine), key=lambda s: _second_name_key(s.name)):
+        for student in sorted(get_all_students(self.engine), key=lambda s: student_name_sort_key(s.name)):
             row = self.table.rowCount()
             self.table.insertRow(row)
             name_item = QTableWidgetItem(student.name or '')
@@ -74,6 +76,7 @@ class EnrolledStudentsDialog(QDialog):
             self.table.setItem(row, 1, QTableWidgetItem(student.student_code or ''))
             section = '' if student.section_number is None else str(student.section_number)
             self.table.setItem(row, 2, QTableWidgetItem(section))
+            self.table.setItem(row, 3, QTableWidgetItem(student.email or ''))
 
     def _add_student_row(self):
         row = self.table.rowCount()
@@ -83,6 +86,7 @@ class EnrolledStudentsDialog(QDialog):
         self.table.setItem(row, 0, name_item)
         self.table.setItem(row, 1, QTableWidgetItem(''))
         self.table.setItem(row, 2, QTableWidgetItem(''))
+        self.table.setItem(row, 3, QTableWidgetItem(''))
         self.table.setCurrentCell(row, 0)
         self.table.editItem(self.table.item(row, 0))
 
@@ -107,13 +111,43 @@ class EnrolledStudentsDialog(QDialog):
             self._removed_student_ids.append(student_id)
         self.table.removeRow(row)
 
+    def _move_student_files_for_section_change(self, student_code: str, old_section: int,
+                                               new_section: int, course_folder: str) -> None:
+        """Move a student's generated quiz/worksheet files from one section folder to another.
+
+        Files are moved under module*/quizzes/section{old} -> section{new} and
+        module*/worksheets/section{old} -> section{new}, preserving their relative
+        subdirectory structure (attempts, questions, answers, JSON, etc.).
+        """
+        if old_section == new_section or not course_folder or not Path(course_folder).expanduser().is_dir():
+            return
+        base = Path(course_folder).expanduser()
+        for subdir in ('quizzes', 'worksheets'):
+            for old_path in base.glob(f'module*/{subdir}/section{old_section}'):
+                new_root = old_path.parent / f'section{new_section}'
+                for old_file in old_path.rglob('*'):
+                    if not old_file.is_file():
+                        continue
+                    # Only move files whose name contains the student code
+                    if student_code not in old_file.name:
+                        continue
+                    rel = old_file.relative_to(old_path)
+                    new_file = new_root / rel
+                    new_file.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(old_file), str(new_file))
+
     def _save_students(self):
         students = []
         try:
+            existing_by_id = {
+                s.student_id: s for s in get_all_students(self.engine, enrolled_only=False)
+            }
+
             for row in range(self.table.rowCount()):
                 name_item = self.table.item(row, 0)
                 code_item = self.table.item(row, 1)
                 section_item = self.table.item(row, 2)
+                email_item = self.table.item(row, 3)
                 section_text = section_item.text().strip() if section_item else ''
                 if section_text and not section_text.isdigit():
                     raise ValueError(f"Section for row {row + 1} must be a whole number.")
@@ -122,19 +156,281 @@ class EnrolledStudentsDialog(QDialog):
                     'name': name_item.text() if name_item else '',
                     'student_code': code_item.text() if code_item else '',
                     'section_number': int(section_text) if section_text else None,
+                    'email': email_item.text() if email_item else '',
                 })
+
+            # A new row whose code or name matches a previously removed student
+            # restores that record rather than creating a duplicate — codes are
+            # unique across all students, so a removed student's code can only
+            # ever be reused by restoring their existing record.
+            removed_students = [s for s in existing_by_id.values() if not s.enrolled]
+            for st in students:
+                if st.get('student_id') is not None:
+                    continue
+                code_norm = (st.get('student_code') or '').strip().casefold()
+                name_norm = (st.get('name') or '').strip().casefold()
+                match = next(
+                    (s for s in removed_students
+                     if code_norm and (s.student_code or '').casefold() == code_norm),
+                    None,
+                ) or next(
+                    (s for s in removed_students
+                     if name_norm and (s.name or '').strip().casefold() == name_norm),
+                    None,
+                )
+                if match is None:
+                    continue
+                reply = QMessageBox.question(
+                    self,
+                    'Restore Removed Student?',
+                    f'"{st["name"]}" ({st["student_code"] or "no code yet"}) matches '
+                    f'previously removed student "{match.name}" ({match.student_code}).\n\n'
+                    "Restore that student's existing record — keeping their quiz and "
+                    'grading history — using the details entered here?\n\n'
+                    "Choose No to go back and edit the row first (a removed student's "
+                    'code cannot be assigned to a brand-new record).',
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    st['student_id'] = match.student_id
+                else:
+                    return
+
+            duplicate_names = self._check_duplicate_names(students)
+            duplicate_emails = self._check_duplicate_emails(students)
+            if duplicate_names or duplicate_emails:
+                messages = []
+                if duplicate_names:
+                    messages.append(
+                        'Duplicate names:\n'
+                        + '\n'.join(f"  {name}" for name in sorted(duplicate_names))
+                    )
+                if duplicate_emails:
+                    messages.append(
+                        'Duplicate emails:\n'
+                        + '\n'.join(f"  {email}" for email in sorted(duplicate_emails))
+                    )
+                reply = QMessageBox.question(
+                    self,
+                    'Duplicate Names or Emails',
+                    '\n\n'.join(messages) + '\n\nDo you want to save anyway?',
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+
+            # Detect section changes for students that already had a section assigned.
+            course_folder = get_course_info(self.engine).get('course_folder', '')
+            section_changes = []
+            for st in students:
+                student_id = st.get('student_id')
+                old_section = existing_by_id.get(student_id).section_number if student_id in existing_by_id else None
+                new_section = st.get('section_number')
+                if student_id is not None and old_section is not None and new_section != old_section:
+                    section_changes.append((st, old_section, new_section))
+
+            if section_changes:
+                change_lines = [
+                    f"  {st['name']} ({st['student_code']}): section {old_section} -> {new_section}"
+                    for st, old_section, new_section in section_changes
+                ]
+                reply = QMessageBox.question(
+                    self,
+                    'Confirm Section Changes',
+                    'The following section changes were detected:\n'
+                    + '\n'.join(change_lines)
+                    + '\n\nMove generated quiz/worksheet files to the new section folders?',
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if reply == QMessageBox.StandardButton.Cancel:
+                    return
+                move_files = (reply == QMessageBox.StandardButton.Yes)
+                if not move_files:
+                    # Revert the section changes if the user chose No.
+                    for st, old_section, _ in section_changes:
+                        st['section_number'] = old_section
+                else:
+                    for st, old_section, new_section in section_changes:
+                        self._move_student_files_for_section_change(
+                            st['student_code'], old_section, new_section, course_folder
+                        )
+
             save_enrolled_students(self.engine, students, self._removed_student_ids)
         except Exception as error:
             QMessageBox.warning(self, 'Could Not Save Students', str(error))
             return
         self._removed_student_ids = []
         self._load_students()
+        parent = self.parentWidget()
+        if isinstance(parent, CourseInfoPanel):
+            parent.students_saved.emit()
         QMessageBox.information(self, 'Students Saved', 'The enrolled-student roster was saved.')
+
+    def _check_duplicate_names(self, students):
+        """Return a set of names that appear more than once or match existing students."""
+        name_counts = Counter(
+            (s.get('name') or '').strip().casefold()
+            for s in students
+            if (s.get('name') or '').strip()
+        )
+        duplicate_names = {name for name, count in name_counts.items() if count > 1}
+
+        edited_ids = {
+            s.get('student_id')
+            for s in students
+            if s.get('student_id') is not None
+        }
+        for existing in get_all_students(self.engine, enrolled_only=False):
+            if existing.student_id in edited_ids:
+                continue
+            name_lower = (existing.name or '').strip().casefold()
+            if name_lower and name_lower in name_counts:
+                duplicate_names.add(name_lower)
+
+        return duplicate_names
+
+    def _check_duplicate_emails(self, students):
+        """Return a set of emails that appear more than once or match existing students."""
+        email_counts = Counter(
+            (s.get('email') or '').strip().casefold()
+            for s in students
+            if (s.get('email') or '').strip()
+        )
+        duplicate_emails = {email for email, count in email_counts.items() if count > 1}
+
+        edited_ids = {
+            s.get('student_id')
+            for s in students
+            if s.get('student_id') is not None
+        }
+        for existing in get_all_students(self.engine, enrolled_only=False):
+            if existing.student_id in edited_ids:
+                continue
+            email_lower = (existing.email or '').strip().casefold()
+            if email_lower and email_lower in email_counts:
+                duplicate_emails.add(email_lower)
+
+        return duplicate_emails
+
+
+class RosterDuplicateEditDialog(QDialog):
+    """Simple dialog for editing a duplicate roster row's name and email."""
+
+    def __init__(self, name, email, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Edit Roster Entry')
+        layout = QFormLayout(self)
+        self.name_edit = QLineEdit(name)
+        self.email_edit = QLineEdit(email)
+        layout.addRow('Name:', self.name_edit)
+        layout.addRow('Email:', self.email_edit)
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addRow(self.button_box)
+
+    def get_values(self):
+        return self.name_edit.text().strip(), self.email_edit.text().strip()
+
+
+class RosterDuplicateDialog(QDialog):
+    """Dialog for reviewing roster rows with duplicate names or emails."""
+
+    def __init__(self, duplicates, parent=None):
+        super().__init__(parent)
+        self.duplicates = duplicates
+        for dup in self.duplicates:
+            dup.setdefault('action', 'skip')
+        self.setWindowTitle('Review Duplicate Roster Entries')
+        self.resize(900, 500)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            'The following rows have names or emails that appear more than once '
+            'in the imported roster. Use the buttons below to edit, skip, or keep each row.'
+        ))
+        self.table = QTableWidget(len(duplicates), 5)
+        self.table.setHorizontalHeaderLabels(['Row #', 'Name', 'Email', 'Issue', 'Decision'])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self._refresh_table()
+        layout.addWidget(self.table)
+
+        btn_layout = QHBoxLayout()
+        edit_btn = QPushButton('Edit Selected')
+        edit_btn.clicked.connect(self._edit_selected)
+        skip_btn = QPushButton('Skip Selected')
+        skip_btn.clicked.connect(self._skip_selected)
+        add_btn = QPushButton('Add Selected Anyway')
+        add_btn.clicked.connect(self._add_selected)
+        btn_layout.addWidget(edit_btn)
+        btn_layout.addWidget(skip_btn)
+        btn_layout.addWidget(add_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+    def _refresh_table(self):
+        for i, dup in enumerate(self.duplicates):
+            self.table.setItem(i, 0, QTableWidgetItem(str(dup['source_row'])))
+            self.table.setItem(i, 1, QTableWidgetItem(dup['name']))
+            self.table.setItem(i, 2, QTableWidgetItem(dup['email']))
+            self.table.setItem(
+                i, 3, QTableWidgetItem('; '.join(dup.get('duplicate_reasons', [])))
+            )
+            decision = 'Add anyway' if dup.get('action') == 'add' else 'Skip'
+            self.table.setItem(i, 4, QTableWidgetItem(decision))
+
+    def _edit_selected(self):
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        dup = self.duplicates[row]
+        dlg = RosterDuplicateEditDialog(dup['name'], dup['email'], self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        name, email = dlg.get_values()
+        if not name or not email or '@' not in email:
+            QMessageBox.warning(self, 'Invalid Entry', 'A valid name and email are required.')
+            return
+        dup['name'] = name
+        dup['email'] = email
+        dup['action'] = 'add'
+        self._refresh_table()
+
+    def _skip_selected(self):
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        self.duplicates[row]['action'] = 'skip'
+        self._refresh_table()
+
+    def _add_selected(self):
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        self.duplicates[row]['action'] = 'add'
+        self._refresh_table()
 
 
 class CourseInfoPanel(QWidget):
     """A reusable panel for managing course information."""
-    
+
+    students_saved = pyqtSignal()
+
     def __init__(self, engine, parent=None):
         """Initialize the course info panel.
         
@@ -156,6 +452,8 @@ class CourseInfoPanel(QWidget):
         self.moodle_url_value = ''
         self.min_signup_value = 24
         self.min_cancel_value = 24
+        self.section_first_day_value = ''
+        self.section_meeting_count_value = 12
 
         self._sections_data: list = []   # list of section dicts currently shown
 
@@ -269,6 +567,28 @@ class CourseInfoPanel(QWidget):
         class_time_layout.addStretch()
         form_layout.addRow("Class Times:", class_time_layout)
 
+        section_first_day_layout = QHBoxLayout()
+        self.section_first_day_input = QLineEdit()
+        self.section_first_day_input.setMaximumWidth(100)
+        self.section_first_day_input.setPlaceholderText("MM-DD")
+        self.section_first_day_input.setToolTip(
+            "Earliest date on which section meetings may occur (defaults to first day of classes)"
+        )
+        section_first_day_layout.addWidget(self.section_first_day_input)
+        section_first_day_layout.addStretch()
+        form_layout.addRow("Section First Day:", section_first_day_layout)
+
+        section_meeting_count_layout = QHBoxLayout()
+        self.section_meeting_count_input = QLineEdit()
+        self.section_meeting_count_input.setMaximumWidth(60)
+        self.section_meeting_count_input.setPlaceholderText("12")
+        self.section_meeting_count_input.setToolTip(
+            "Maximum number of meetings per section"
+        )
+        section_meeting_count_layout.addWidget(self.section_meeting_count_input)
+        section_meeting_count_layout.addStretch()
+        form_layout.addRow("# Section Meetings:", section_meeting_count_layout)
+
         self.class_classroom_combo = QComboBox()
         self.class_classroom_combo.setMinimumWidth(240)
         self.class_classroom_combo.setEditable(True)
@@ -321,6 +641,12 @@ class CourseInfoPanel(QWidget):
         manage_students_btn = QPushButton('Manage Enrolled Students…')
         manage_students_btn.clicked.connect(self._manage_enrolled_students)
         sec_btn_row.addWidget(manage_students_btn)
+        compute_dates_btn = QPushButton("Compute Section Dates from Calendar")
+        compute_dates_btn.setToolTip(
+            'Fill each section\'s Meeting Dates from the Semester Calendar and its Day of Week'
+        )
+        compute_dates_btn.clicked.connect(self._compute_all_section_dates)
+        sec_btn_row.addWidget(compute_dates_btn)
         sec_btn_row.addStretch()
         layout.addLayout(sec_btn_row)
 
@@ -383,6 +709,8 @@ class CourseInfoPanel(QWidget):
             self.class_days_input.setText(info.get('class_days', 'T,Th'))
             self.class_start_input.setText(info.get('class_start_time', '15:55'))
             self.class_end_input.setText(info.get('class_end_time', '17:15'))
+            self.section_first_day_input.setText(info.get('section_first_day', ''))
+            self.section_meeting_count_input.setText(str(info.get('section_meeting_count', 12)))
             self._populate_classroom_combo(self.class_classroom_combo,
                                            info.get('class_classroom', ''))
             # sync instance vars
@@ -395,8 +723,11 @@ class CourseInfoPanel(QWidget):
             self.moodle_url_value    = info.get('moodle_url', '')
             self.min_signup_value    = info.get('min_signup_time', 24)
             self.min_cancel_value    = info.get('min_cancel_time', 24)
+            self.section_first_day_value = info.get('section_first_day', '')
+            self.section_meeting_count_value = info.get('section_meeting_count', 12)
             self.load_modules_into_table()
             self._load_sections_into_table()
+            self._ensure_lecture_meetings(silent=True)
             return True
         except Exception as e:
             print(f"[ERROR] Failed to load course info: {e}")
@@ -418,10 +749,14 @@ class CourseInfoPanel(QWidget):
                 'moodle_url':      self.moodle_url_input.text().strip(),
                 'min_signup_time': int(min_signup_text) if min_signup_text.isdigit() else 24,
                 'min_cancel_time': int(min_cancel_text) if min_cancel_text.isdigit() else 24,
-                'class_days':       self.class_days_input.text().strip(),
-                'class_start_time': self.class_start_input.text().strip(),
-                'class_end_time':   self.class_end_input.text().strip(),
-                'class_classroom':  self.class_classroom_combo.currentText().strip(),
+                'class_days':         self.class_days_input.text().strip(),
+                'class_start_time':   self.class_start_input.text().strip(),
+                'class_end_time':         self.class_end_input.text().strip(),
+                'class_classroom':        self.class_classroom_combo.currentText().strip(),
+                'section_first_day':      self.section_first_day_input.text().strip(),
+                'section_meeting_count':  int(self.section_meeting_count_input.text().strip())
+                                          if self.section_meeting_count_input.text().strip().isdigit()
+                                          else 12,
             }
             save_course_info(self.engine, data)
 
@@ -447,6 +782,8 @@ class CourseInfoPanel(QWidget):
             self.moodle_url_value    = data['moodle_url']
             self.min_signup_value    = data['min_signup_time']
             self.min_cancel_value    = data['min_cancel_time']
+            self.section_first_day_value = data['section_first_day']
+            self.section_meeting_count_value = data['section_meeting_count']
 
             # Propagate to parent app if available
             if self.parent:
@@ -466,15 +803,17 @@ class CourseInfoPanel(QWidget):
     def get_course_info(self):
         """Return the currently-displayed course info as a dict."""
         return {
-            'course':          self.course_value,
-            'year':            self.year_value,
-            'semester':        self.semester_value,
-            'course_title':    self.course_title_value,
-            'instructors':     self.instructors_value,
-            'course_folder':   self.course_folder_value,
-            'moodle_url':      self.moodle_url_value,
-            'min_signup_time': self.min_signup_value,
-            'min_cancel_time': self.min_cancel_value,
+            'course':              self.course_value,
+            'year':                self.year_value,
+            'semester':            self.semester_value,
+            'course_title':        self.course_title_value,
+            'instructors':         self.instructors_value,
+            'course_folder':       self.course_folder_value,
+            'moodle_url':          self.moodle_url_value,
+            'min_signup_time':       self.min_signup_value,
+            'min_cancel_time':       self.min_cancel_value,
+            'section_first_day':     self.section_first_day_value,
+            'section_meeting_count': self.section_meeting_count_value,
         }
         
     # ------------------------------------------------------------------
@@ -578,7 +917,6 @@ class CourseInfoPanel(QWidget):
         EnrolledStudentsDialog(self.engine, self).exec()
 
     def _import_section_roster(self):
-        from PyQt6.QtWidgets import QInputDialog
         sections = get_all_sections(self.engine)
         if not sections:
             QMessageBox.warning(self, 'No Sections', 'Define and save a course section before importing its roster.')
@@ -595,9 +933,27 @@ class CourseInfoPanel(QWidget):
         if not path:
             return
         try:
-            from student_roster26 import import_section_roster
-            imported = import_section_roster(path, self.engine, int(section_text))
-            QMessageBox.information(self, 'Roster Imported', f'Imported or updated {imported} students.')
+            from student_roster26 import preview_section_roster, import_section_roster
+
+            section_number = int(section_text)
+            preview = preview_section_roster(path, self.engine, section_number)
+
+            rows = preview['rows']
+            if preview['duplicates']:
+                dlg = RosterDuplicateDialog(preview['duplicates'], self)
+                if dlg.exec() != QDialog.DialogCode.Accepted:
+                    return
+                rows = [row for row in rows if row.get('action') != 'skip']
+
+            result = import_section_roster(rows, self.engine, section_number)
+            message = f"Imported or updated {result['imported']} students."
+            if result['conflicts']:
+                conflict_text = '\n'.join(result['conflicts'])
+                message += (
+                    f"\n\nThe following rows were skipped because they matched "
+                    f"existing students ambiguously:\n\n{conflict_text}"
+                )
+            QMessageBox.information(self, 'Roster Imported', message)
         except Exception as error:
             QMessageBox.warning(self, 'Could Not Import Roster', str(error))
 
@@ -643,6 +999,23 @@ class CourseInfoPanel(QWidget):
                 'code':           _cell(8),
             })
             self._save_section_meetings(section_number, meeting_dates, start_time, end_time)
+
+        # Ensure whole-class lecture meetings exist from the course calendar.
+        self._ensure_lecture_meetings(silent=True)
+
+    def _ensure_lecture_meetings(self, silent: bool = False):
+        """Generate lecture_meetings rows if the table is empty and calendar allows."""
+        try:
+            if get_lecture_meetings(self.engine):
+                return
+            generate_lecture_meetings(self.engine)
+        except Exception as error:
+            if not silent:
+                QMessageBox.warning(
+                    self,
+                    'Could Not Generate Lecture Dates',
+                    str(error),
+                )
 
     @staticmethod
     def _format_meeting_dates(dates):
@@ -704,17 +1077,31 @@ class CourseInfoPanel(QWidget):
             day_str = day_item.text().strip() if day_item else ''
             if not day_str:
                 continue
+            # Section meetings may start on a different date than the first day of classes
+            # and are capped at the configured number per section.
+            course = get_course_info(self.engine)
+            section_first_day = course.get('section_first_day') or cal['first_day']
+            max_meetings = course.get('section_meeting_count') or 12
             dates = compute_meeting_dates(
-                first_day=cal['first_day'],
+                first_day=section_first_day,
                 last_day=cal['last_day'],
                 days_of_week=[d.strip() for d in day_str.split(',') if d.strip()],
                 no_class_days=cal['no_class_days'],
                 brandeis_days=cal['brandeis_days'],
-            )
+            )[:max_meetings]
             # Store as [month, day] pairs
             month_day = [[int(d.split('-')[1]), int(d.split('-')[2])] for d in dates]
             save_section(self.engine, {'section_number': sec_num, 'meeting_dates': month_day})
+            # Reflect the computed dates in the table so they are persisted with the section
+            dates_item = self.sections_table.item(row, 4)
+            if dates_item is None:
+                dates_item = QTableWidgetItem()
+                self.sections_table.setItem(row, 4, dates_item)
+            dates_item.setText(self._format_meeting_dates(month_day))
             updated += 1
+        # Persist all visible section rows (including computed dates) to section_meetings.
+        self._save_sections_from_table()
+        self._load_sections_into_table()
         QMessageBox.information(
             self, "Done",
             f"Meeting dates computed and saved for {updated} section(s).")

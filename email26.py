@@ -1,14 +1,14 @@
-"""MCQ26 email generation and sending (feedback-only).
+"""MCQ26 email generation and sending (quiz feedback only).
 
 This module is a simplified port of the legacy
 bubbleSheet/MCQ/generate_signup_email.py and bubbleSheet/MCQ/getEmail.py
-routines.  It intentionally contains only quiz-feedback content; signup /
-scheduling content is omitted while the MCQ26 signup design is undecided.
+routines. MCQ26 has no quiz-session-signup emails (no signup confirmations
+or signup-problem notifications) - the only email content is quiz feedback.
 
-Legacy routines that would supply the omitted content are noted in comments.
+Feedback emails are always queued (database26.OutgoingEmail) rather than
+sent immediately; a staff member reviews and sends them from the Email
+Management panel (email_management26.py).
 """
-import os
-import json
 import base64
 import logging
 from datetime import datetime
@@ -24,35 +24,7 @@ from database26 import (
 from token_refresh26 import get_gmail_service
 
 logger = logging.getLogger(__name__)
-
-# Autosend configuration -----------------------------------------------------
-# Stored in a small JSON file so the setting persists across runs.
-_AUTOSEND_CONFIG_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), 'email_autosend.json'
-)
-
-
-def _load_autosend() -> bool:
-    try:
-        with open(_AUTOSEND_CONFIG_FILE, 'r') as f:
-            return bool(json.load(f).get('autosend', False))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return False
-
-
-def _save_autosend(enabled: bool) -> None:
-    with open(_AUTOSEND_CONFIG_FILE, 'w') as f:
-        json.dump({'autosend': bool(enabled)}, f, indent=2)
-
-
-def get_autosend_status() -> bool:
-    """Return True if feedback emails should be sent automatically."""
-    return _load_autosend()
-
-
-def set_autosend_status(enabled: bool) -> None:
-    """Persist the autosend setting."""
-    _save_autosend(enabled)
+TEST_FEEDBACK_RECIPIENT = 'nelson@brandeis.edu'
 
 
 # Student lookup -------------------------------------------------------------
@@ -80,7 +52,6 @@ def generate_quiz_feedback_text(
     module_number: int,
     date_taken: str,
     passing: bool,
-    completed: bool,
     detailed_feedback: Optional[str] = None,
     is_regrade: bool = False,
 ) -> str:
@@ -94,10 +65,10 @@ def generate_quiz_feedback_text(
     lines.append(
         f"For the Module {module_number} Quiz taken on {date_taken} you received a score of {quiz_score}%."
     )
-    if completed:
-        lines.append("This is an excellent grade and you have now passed and completed this module.")
-    elif passing:
-        lines.append("This is a passing grade.")
+    if passing:
+        if quiz_score > 89:
+            lines.append("This is an excellent score.")
+        lines.append(f"You have now passed module {module_number}.")
     else:
         lines.append("This is not a passing grade, but you can retake it.")
 
@@ -119,12 +90,11 @@ def generate_quiz_feedback_email(
 ) -> Tuple[str, str, Dict[str, Any]]:
     """Generate a feedback-only email.
 
-    Returns (subject, body, context_dict).  The body contains only quiz
-    feedback.  Legacy signup/scheduling content would be appended here; see
-    comments below.
+    Returns (subject, body, context_dict). MCQ26 has no signup emails, so
+    the body contains only quiz feedback.
 
-    Legacy routine that produced the combined email:
-      bubbleSheet/MCQ/generate_signup_email.py:generate_email
+    Legacy routine this was ported from (which also included signup/
+    scheduling content, now removed): bubbleSheet/MCQ/generate_signup_email.py:generate_email
     """
     if engine is None:
         engine = create_db_engine()
@@ -137,16 +107,21 @@ def generate_quiz_feedback_email(
 
     course_info = get_course_info(engine)
     passing_threshold = float(course_info.get('passing_threshold', 65.0))
-    completion_threshold = float(course_info.get('completion_threshold', 90.0))
 
     passing = quiz_score >= passing_threshold
-    completed = quiz_score >= completion_threshold
 
-    subject = f"Quiz Feedback for {student_info['name']}"
+    subject = f"Quiz {module_number} Feedback for {student_info['name']}"
 
     body_lines = [
         f"Dear {student_info['name']},",
         "",
+    ]
+    if is_regrade:
+        body_lines += [
+            "An error was detected in the initial grading of this quiz and so it has been manually rescored.",
+            "",
+        ]
+    body_lines += [
         "Here is your personalized quiz feedback:",
         "",
         generate_quiz_feedback_text(
@@ -154,19 +129,15 @@ def generate_quiz_feedback_email(
             module_number=module_number,
             date_taken=date_taken,
             passing=passing,
-            completed=completed,
             detailed_feedback=detailed_feedback,
             is_regrade=is_regrade,
         ),
         "",
-        # SIGNUP / SCHEDULING CONTENT HOOK
-        # If MCQ26 later reintroduces signups, append the legacy content here.
-        # Available quiz sessions can be supplied by the legacy routine:
-        #   bubbleSheet/MCQ/generate_signup_email.py:get_available_blocks
-        # and formatted by:
-        #   bubbleSheet/MCQ/generate_signup_email.py:format_available_blocks_with_checks
         "Best regards,",
-        f"Professors {course_info.get('instructors', 'Sacha Nelson')}",
+        f"Professor {course_info.get('instructors')}",
+        "",
+        "********************************************",
+        "Please do not reply; this account is monitored infrequently. Send email intended for Sacha Nelson to 'nelson@brandeis.edu'",
     ]
 
     body = "\n".join(body_lines)
@@ -177,7 +148,6 @@ def generate_quiz_feedback_email(
         'module_number': module_number,
         'date_taken': date_taken,
         'passing': passing,
-        'completed': completed,
         'is_regrade': is_regrade,
     }
     return subject, body, context
@@ -223,24 +193,62 @@ def send_email(
         return False
 
 
-def generate_and_send_quiz_feedback(
+def queue_test_quiz_feedback(
     student_code: str,
     quiz_score: int,
     module_number: int,
     date_taken: Optional[str] = None,
     detailed_feedback: Optional[str] = None,
     is_regrade: bool = False,
-    force_send: bool = False,
     engine=None,
 ) -> Dict[str, Any]:
-    """Generate feedback email and send it or return it for manual review.
+    if engine is None:
+        engine = create_db_engine()
+    subject, body, context = generate_quiz_feedback_email(
+        student_code=student_code,
+        quiz_score=quiz_score,
+        module_number=module_number,
+        date_taken=date_taken,
+        detailed_feedback=detailed_feedback,
+        is_regrade=is_regrade,
+        engine=engine,
+    )
+    student_email = context['student_info'].get('email') or '(no student email address)'
+    test_line = f'TEST MODE, email would have been sent to {student_email}.'
+    body = f'{test_line}\n\n{body}'
+    subject = f'[TEST MODE] {subject}'
+    email_id = queue_outgoing_email(
+        engine, TEST_FEEDBACK_RECIPIENT, subject, body, 'test_quiz_feedback',
+    )
+    return {
+        'queued': True,
+        'email_id': email_id,
+        'subject': subject,
+        'body': body,
+        'recipient': TEST_FEEDBACK_RECIPIENT,
+        'intended_recipient': student_email,
+        'context': context,
+    }
+
+
+def generate_and_queue_quiz_feedback(
+    student_code: str,
+    quiz_score: int,
+    module_number: int,
+    date_taken: Optional[str] = None,
+    detailed_feedback: Optional[str] = None,
+    is_regrade: bool = False,
+    engine=None,
+) -> Dict[str, Any]:
+    """Generate a feedback email and queue it for a staff member to review and send.
+
+    Feedback emails are never sent automatically - use the Email Management
+    panel (email_management26.py) to review and send queued emails via
+    send_queued_email.
 
     Returns a dict:
-      {'sent': True}  - email was sent successfully
-      {'sent': False, 'reason': 'autosend_disabled', 'subject': ..., 'body': ..., 'recipient': ...}
-                       - caller can queue / display it manually
-      {'sent': False, 'reason': ..., 'error': ...}
-                       - something went wrong
+      {'queued': True, 'email_id': ..., 'subject': ..., 'body': ..., 'recipient': ..., 'context': ...}
+      {'queued': False, 'reason': ..., 'error': ...}  - something went wrong (e.g. no email on file)
     """
     if engine is None:
         engine = create_db_engine()
@@ -258,48 +266,19 @@ def generate_and_send_quiz_feedback(
     recipient = student_info['email']
     if not recipient:
         return {
-            'sent': False,
+            'queued': False,
             'reason': 'no_email',
             'error': f"Student {student_code} has no email address",
         }
 
-    if not force_send and not get_autosend_status():
-        email_id = queue_outgoing_email(
-            engine, recipient, subject, body, 'quiz_feedback',
-        )
-        return {
-            'sent': False,
-            'reason': 'autosend_disabled',
-            'email_id': email_id,
-            'subject': subject,
-            'body': body,
-            'recipient': recipient,
-            'context': context,
-        }
-
-    service = get_gmail_service()
-    if service is None:
-        return {
-            'sent': False,
-            'reason': 'no_service',
-            'error': 'Unable to create Gmail service',
-            'subject': subject,
-            'body': body,
-            'recipient': recipient,
-        }
-
-    ok = send_email(service, recipient, subject, body, email_type='quiz_feedback')
-    if ok:
-        email_id = queue_outgoing_email(engine, recipient, subject, body, 'quiz_feedback')
-        update_outgoing_email_status(engine, email_id, 'sent')
-        return {'sent': True, 'recipient': recipient, 'context': context}
+    email_id = queue_outgoing_email(engine, recipient, subject, body, 'quiz_feedback')
     return {
-        'sent': False,
-        'reason': 'send_failed',
-        'error': 'send_email returned False',
+        'queued': True,
+        'email_id': email_id,
         'subject': subject,
         'body': body,
         'recipient': recipient,
+        'context': context,
     }
 
 

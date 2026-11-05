@@ -46,17 +46,17 @@ from database26 import (
     get_all_sections, get_students_for_section, get_all_students_as_dicts,
     get_student_by_code, get_section, update_quiz_odt_values,
     update_quiz_odt_info, get_student_module_question_ids, reset_quiz_data,
-    NUM_MODULES,
+    student_name_sort_key, NUM_MODULES,
 )
 from shared_gui26 import BaseMCQApp
 from course_info_panel26 import CourseInfoPanel
 from llm_converter26 import LLMConverter
 from quiz_generator26 import (
-    _find_start_attempt, create_quizzes_for_students, load_question_banks,
-    pdf_page_count, stamp_page_numbers_to_pdf,
+    _find_start_attempt, _module_quiz_folder, create_quizzes_for_students,
+    load_question_banks, pdf_page_count, stamp_page_numbers_to_pdf,
 )
 from document_ids26 import artifact_id, format_quiz_id
-from OneUn import load_problem_definition, OneUnODTGenerator, ProblemDefinition
+from OneUn import answer_template_total_points, load_problem_definition, OneUnODTGenerator, ProblemDefinition
 
 
 
@@ -72,7 +72,10 @@ class MCQGeneratorGUI(BaseMCQApp):
         self.defaults['module'] = 1
         
         # Quiz generation parameters
-        self.defaults['totalQuestions'] = 20  # Used in quiz creator tab
+        try:
+            self.defaults['totalQuestions'] = int(self.settings.value('totalQuestions', 20))
+        except (TypeError, ValueError):
+            self.defaults['totalQuestions'] = 20  # Used in quiz creator tab
     
     def __init__(self):
         """Initialize the GUI."""
@@ -212,6 +215,12 @@ class MCQGeneratorGUI(BaseMCQApp):
         self.total_questions_input = QSpinBox()
         self.total_questions_input.setRange(1, 1000)
         self.total_questions_input.setValue(self.defaults['totalQuestions'])
+        self.total_questions_input.valueChanged.connect(
+            lambda value: (
+                self.defaults.__setitem__('totalQuestions', value),
+                self.settings.setValue('totalQuestions', value),
+            )
+        )
         total_questions_layout.addWidget(self.total_questions_input)
         
         total_questions_layout.addSpacing(20)
@@ -233,14 +242,26 @@ class MCQGeneratorGUI(BaseMCQApp):
         )
         form_layout.addRow("", self.append_oneun_checkbox)
 
-        # Group packet option
-        self.create_packet_checkbox = QCheckBox("Create group packet PDF")
-        self.create_packet_checkbox.setChecked(False)
-        self.create_packet_checkbox.setToolTip(
-            "Merge all generated quiz PDFs into a single group packet, "
+        # Group packet option: none / per-section packets / one combined packet
+        packet_layout = QHBoxLayout()
+        self.packet_none_radio = QRadioButton("No group packet")
+        self.packet_section_radio = QRadioButton("Section group packets")
+        self.packet_single_radio = QRadioButton("Single packet")
+        self.packet_none_radio.setChecked(True)
+        for _r in (self.packet_none_radio, self.packet_section_radio,
+                   self.packet_single_radio):
+            packet_layout.addWidget(_r)
+        packet_layout.addStretch()
+        _packet_tip = (
+            "Merge generated quiz PDFs into a group packet with a cover sheet, "
             "sorted by student last name. Answer keys are not included."
         )
-        form_layout.addRow("", self.create_packet_checkbox)
+        self.packet_none_radio.setToolTip("Keep generated quiz PDFs separate.")
+        self.packet_section_radio.setToolTip(
+            _packet_tip + " One packet per section.")
+        self.packet_single_radio.setToolTip(
+            _packet_tip + " All selected students in one packet with a single cover sheet.")
+        form_layout.addRow("Group packet:", packet_layout)
 
         # Reset quiz data (testing)
         reset_layout = QHBoxLayout()
@@ -456,57 +477,91 @@ class MCQGeneratorGUI(BaseMCQApp):
 
             bank_questions = load_question_banks(bank_paths)
 
-            if self.append_oneun_checkbox.isChecked():
-                created = self._append_oneun_to_quiz(
-                    module_number=module_number,
-                    student_codes=student_codes,
-                    total_mcq_questions=total_bank_questions,
-                    bank_paths=bank_paths,
-                    questions_per_bank=questions_per_bank,
-                    quiz_date=quiz_date,
-                    attempts=attempts,
-                    course_folder=course_folder,
-                    bank_questions=bank_questions,
-                )
-            else:
-                created = create_quizzes_for_students(
-                    engine=self.engine,
-                    module_number=module_number,
-                    student_codes=student_codes,
-                    bank_paths=bank_paths,
-                    questions_per_bank=questions_per_bank,
-                    quiz_date=quiz_date,
-                    attempts=attempts,
-                    course_folder=course_folder,
-                    bank_questions=bank_questions,
-                )
-                quiz_folder = os.path.join(course_folder, f'module{module_number}', 'quizzes')
-                for code, quiz_ids in created.items():
-                    for quiz_id in quiz_ids:
-                        attempt = int(quiz_id.split('_')[-1])
-                        quiz_pdf = os.path.join(quiz_folder, f'attempt{attempt}', 'questions', f'{artifact_id(quiz_id, "Q")}.pdf')
-                        if os.path.exists(quiz_pdf):
-                            stamp_page_numbers_to_pdf(quiz_pdf)
+            code_groups = self._group_codes_by_section(student_codes)
+            all_created: Dict[str, List[str]] = {}
+            for section_number, section_codes in sorted(code_groups.items()):
+                if not section_codes:
+                    continue
 
-            if self.create_packet_checkbox.isChecked():
-                try:
-                    packet_title = 'MCQ + Quant Quiz Packet' if self.append_oneun_checkbox.isChecked() else 'MCQ Quiz Packet'
-                    self._create_quiz_packets(
-                        created, module_number, course_folder, title=packet_title
+                if self.append_oneun_checkbox.isChecked():
+                    section_created = self._append_oneun_to_quiz(
+                        module_number=module_number,
+                        student_codes=section_codes,
+                        total_mcq_questions=total_bank_questions,
+                        bank_paths=bank_paths,
+                        questions_per_bank=questions_per_bank,
+                        quiz_date=quiz_date,
+                        attempts=attempts,
+                        course_folder=course_folder,
+                        bank_questions=bank_questions,
+                        section_number=section_number,
                     )
+                else:
+                    section_created = create_quizzes_for_students(
+                        engine=self.engine,
+                        module_number=module_number,
+                        student_codes=section_codes,
+                        bank_paths=bank_paths,
+                        questions_per_bank=questions_per_bank,
+                        quiz_date=quiz_date,
+                        attempts=attempts,
+                        course_folder=course_folder,
+                        bank_questions=bank_questions,
+                    )
+                    quiz_folder = _module_quiz_folder(module_number, course_folder, section=section_number)
+                    for code, quiz_ids in section_created.items():
+                        for quiz_id in quiz_ids:
+                            attempt = int(quiz_id.split('_')[-1])
+                            quiz_pdf = os.path.join(quiz_folder, f'attempt{attempt}', 'questions', f'{artifact_id(quiz_id, "Q")}.pdf')
+                            if os.path.exists(quiz_pdf):
+                                stamp_page_numbers_to_pdf(quiz_pdf)
+
+                all_created.update(section_created)
+
+            if not self.packet_none_radio.isChecked():
+                try:
+                    base_packet_title = (
+                        'MCQ + Quant Quiz Packet' if self.append_oneun_checkbox.isChecked()
+                        else 'MCQ Quiz Packet'
+                    )
+                    if self.packet_single_radio.isChecked():
+                        self._create_single_packet(
+                            all_created,
+                            module_number,
+                            course_folder,
+                            title=base_packet_title,
+                        )
+                    else:
+                        for section_number in sorted(code_groups.keys()):
+                            section_created = {
+                                code: ids for code, ids in all_created.items()
+                                if (self._section_for_code(code) or 0) == section_number
+                            }
+                            if not section_created:
+                                continue
+                            letter = self._next_packet_letter(section_number, module_number, course_folder)
+                            group_prefix = f'S{section_number}{letter}'
+                            self._create_quiz_packets(
+                                section_created,
+                                module_number,
+                                course_folder,
+                                title=f'{base_packet_title} (Section {section_number})',
+                                section=section_number,
+                                group_prefix=group_prefix,
+                            )
                 except Exception as pkt_err:
                     print(f"[ERROR] Failed to create quiz packet: {pkt_err}")
                     import traceback
                     traceback.print_exc()
 
-            total_quizzes = sum(len(v) for v in created.values())
-            created_codes = ', '.join(sorted(created.keys()))
+            total_quizzes = sum(len(v) for v in all_created.values())
+            created_codes = ', '.join(sorted(all_created.keys()))
 
             QMessageBox.information(
                 self,
                 "Quizzes Created",
-                f"Created {total_quizzes} quiz file(s) for {len(created)} student(s): {created_codes}\n"
-                f"Stored in module {module_number}/quizzes/"
+                f"Created {total_quizzes} quiz file(s) for {len(all_created)} student(s): {created_codes}\n"
+                f"Stored in module {module_number}/quizzes/section*/"
             )
 
         except Exception as e:
@@ -521,11 +576,14 @@ class MCQGeneratorGUI(BaseMCQApp):
                               quiz_date: str,
                               attempts: Optional[int] = None,
                               course_folder: str = '',
-                              bank_questions: Optional[Dict] = None):
-        """Generate One Unknown ODTs appended to the MCQ PDFs.
+                              bank_questions: Optional[Dict] = None,
+                              section_number: Optional[int] = None):
+        """Generate One Unknown ODTs appended to the MCQ PDFs for one section.
 
         Selects a random starting template set and then proceeds through the
         requested number of attempts, one per template set, wrapping cyclically.
+        When *section_number* is provided only students in that section are processed
+        and files are read/written under module{M}/quizzes/section{S}.
         """
         params = self._oneun_get_params()
         if params is None:
@@ -534,10 +592,25 @@ class MCQGeneratorGUI(BaseMCQApp):
         (definition_sets, base_seed, metadata, plot_config,
          _module, _doc_type, _) = params
 
+        if _module != module_number:
+            raise ValueError(
+                f"Module mismatch: Quiz Creator is using module {module_number}, "
+                f"but Quant ODT tab is set to module {_module}. "
+                "Both modules must match when appending a Quant ODT."
+            )
+
         if _doc_type != 'Quiz':
             raise ValueError(
                 "One Unknown document type must be 'Quiz' when appending to an MCQ quiz."
             )
+
+        if section_number is not None:
+            student_codes = [
+                code for code in student_codes
+                if (self._section_for_code(code) or 0) == section_number
+            ]
+            if not student_codes:
+                raise ValueError(f"No students in section {section_number} to append ODT to.")
 
         if attempts is None:
             course_info = get_course_info(self.engine)
@@ -557,7 +630,7 @@ class MCQGeneratorGUI(BaseMCQApp):
             for a in range(attempts)
         ]
 
-        quiz_folder = os.path.join(course_folder, 'module' + str(module_number), 'quizzes')
+        quiz_folder = _module_quiz_folder(module_number, course_folder, section=section_number)
         odt_quiz_folder = os.path.join(course_folder, 'module' + str(module_number), 'templates', 'ODT_quizzes')
         os.makedirs(odt_quiz_folder, exist_ok=True)
 
@@ -724,7 +797,13 @@ class MCQGeneratorGUI(BaseMCQApp):
                 odt_value = values_list[idx] if idx < len(values_list) else None
                 odt_template = template_paths_list[idx] if idx < len(template_paths_list) else None
                 odt_var_names = var_names_list[idx] if idx < len(var_names_list) else None
-                update_quiz_odt_info(self.engine, quiz_id, odt_template, odt_var_names, odt_value)
+                set_index = student_set_indices[code][idx]
+                answer_template = definition_sets[set_index]['answer_key_template_path']
+                quant_total_points = answer_template_total_points(answer_template)
+                update_quiz_odt_info(
+                    self.engine, quiz_id, odt_template, odt_var_names, odt_value,
+                    quant_total_points=quant_total_points,
+                )
 
         # -------------------------------------------------------------------
         # 5. Append each ODT PDF to the corresponding MCQ PDF
@@ -736,9 +815,13 @@ class MCQGeneratorGUI(BaseMCQApp):
                 if (code, attempt_index) in odt_pdf_map and os.path.exists(quiz_pdf):
                     self._append_pdf_to_pdf(quiz_pdf, odt_pdf_map[(code, attempt_index)], quiz_pdf)
 
-                ak_pdf = os.path.join(quiz_folder, f'attempt{attempt}', 'answers', artifact_id(quiz_id, 'A') + '.pdf')
-                if (code, attempt_index) in odt_ak_pdf_map and os.path.exists(ak_pdf):
-                    self._append_pdf_to_pdf(ak_pdf, odt_ak_pdf_map[(code, attempt_index)], ak_pdf)
+                quant_key_pdf = os.path.join(
+                    quiz_folder, f'attempt{attempt}', 'answers', 'QUANT',
+                    f'{quiz_id}_quant_answer.pdf',
+                )
+                if (code, attempt_index) in odt_ak_pdf_map:
+                    os.makedirs(os.path.dirname(quant_key_pdf), exist_ok=True)
+                    shutil.copy2(odt_ak_pdf_map[(code, attempt_index)], quant_key_pdf)
 
         # -------------------------------------------------------------------
         # 6. Stamp page numbers on the combined PDFs
@@ -749,9 +832,18 @@ class MCQGeneratorGUI(BaseMCQApp):
                 quiz_pdf = os.path.join(quiz_folder, f'attempt{attempt}', 'questions', artifact_id(quiz_id, 'Q') + '.pdf')
                 if os.path.exists(quiz_pdf):
                     stamp_page_numbers_to_pdf(quiz_pdf)
-                ak_pdf = os.path.join(quiz_folder, f'attempt{attempt}', 'answers', artifact_id(quiz_id, 'A') + '.pdf')
-                if os.path.exists(ak_pdf):
-                    stamp_page_numbers_to_pdf(ak_pdf)
+                mcq_key_pdf = os.path.join(
+                    quiz_folder, f'attempt{attempt}', 'answers', 'MCQ',
+                    artifact_id(quiz_id, 'A') + '.pdf',
+                )
+                if os.path.exists(mcq_key_pdf):
+                    stamp_page_numbers_to_pdf(mcq_key_pdf)
+                quant_key_pdf = os.path.join(
+                    quiz_folder, f'attempt{attempt}', 'answers', 'QUANT',
+                    f'{quiz_id}_quant_answer.pdf',
+                )
+                if os.path.exists(quant_key_pdf):
+                    stamp_page_numbers_to_pdf(quant_key_pdf)
 
         # -------------------------------------------------------------------
         # 6. Summary log
@@ -781,7 +873,8 @@ class MCQGeneratorGUI(BaseMCQApp):
         return created
 
     def _convert_odt_to_pdf(self, odt_path: str, output_dir: str,
-                            insert_blank_pages: bool = False) -> str:
+                            insert_blank_pages: bool = False,
+                            pad_to_even_pages: bool = False) -> str:
         '''Convert an ODT file to PDF using LibreOffice headless.'''
         office_bin = None
         for name in ('soffice', 'libreoffice'):
@@ -825,15 +918,22 @@ class MCQGeneratorGUI(BaseMCQApp):
                 raise FileNotFoundError('PDF output not found for ' + odt_path)
             expected_pdf = os.path.join(output_dir, sorted(candidates)[-1])
 
-        if insert_blank_pages:
+        if insert_blank_pages or pad_to_even_pages:
             from pypdf import PdfReader, PdfWriter
             reader = PdfReader(expected_pdf)
             writer = PdfWriter()
             for page in reader.pages:
                 writer.add_page(page)
+                if insert_blank_pages:
+                    writer.add_blank_page(
+                        width=float(page.mediabox.width),
+                        height=float(page.mediabox.height)
+                    )
+            if pad_to_even_pages and len(writer.pages) % 2 != 0:
+                last_page = writer.pages[-1]
                 writer.add_blank_page(
-                    width=float(page.mediabox.width),
-                    height=float(page.mediabox.height)
+                    width=float(last_page.mediabox.width),
+                    height=float(last_page.mediabox.height)
                 )
             tmp_pdf = expected_pdf + '.blanks.tmp'
             with open(tmp_pdf, 'wb') as f:
@@ -856,16 +956,14 @@ class MCQGeneratorGUI(BaseMCQApp):
         os.replace(tmp_path, output_pdf_path)
 
     def _student_sort_key(self, code: str):
-        """Return a sort key (last name, full name) for a student code."""
+        """Return a sort key (second name, first name, full name) for a student code."""
         student = get_student_by_code(self.engine, code)
         if student is None or not student.name:
-            return ('~', '')
-        parts = student.name.strip().split()
-        last = parts[-1].lower() if parts else ''
-        return (last, student.name.lower())
+            return ('~', '~', '')
+        return student_name_sort_key(student.name) + (student.name.lower(),)
 
-    def _sort_codes_by_last_name(self, codes: List[str]) -> List[str]:
-        """Return student codes sorted by last name."""
+    def _sort_codes_by_second_name(self, codes: List[str]) -> List[str]:
+        """Return student codes sorted by second name (first surname)."""
         return sorted(codes, key=self._student_sort_key)
 
     def _merge_pdfs(self, pdf_paths: List[str], output_pdf_path: str,
@@ -905,7 +1003,7 @@ class MCQGeneratorGUI(BaseMCQApp):
 
         pdf.set_font('Helvetica', '', 11)
         line_h = 7
-        sorted_codes = self._sort_codes_by_last_name(student_codes)
+        sorted_codes = self._sort_codes_by_second_name(student_codes)
         for code in sorted_codes:
             student = get_student_by_code(self.engine, code)
             name = student.name if student and student.name else code
@@ -930,9 +1028,16 @@ class MCQGeneratorGUI(BaseMCQApp):
         pdf.output(output_path)
 
     def _create_quiz_packets(self, created: Dict[str, List[str]], module_number: int,
-                             course_folder: str, title: str = 'Quiz Packet'):
-        '''Merge MCQ question PDFs for each attempt into a single group packet.'''
-        quiz_folder = os.path.join(course_folder, f'module{module_number}', 'quizzes')
+                             course_folder: str, title: str = 'Quiz Packet',
+                             section: Optional[int] = None,
+                             group_prefix: str = 'Group'):
+        '''Merge MCQ question PDFs for each attempt into a single group packet.
+
+        If *section* is provided the files are looked up under
+        module{module_number}/quizzes/section{section}.  *group_prefix*
+        replaces the default 'Group' token used in the packet file name.
+        '''
+        quiz_folder = _module_quiz_folder(module_number, course_folder, section=section)
         attempts: Dict[int, List[Tuple[str, str]]] = {}
         for code, quiz_ids in created.items():
             for quiz_id in quiz_ids:
@@ -945,23 +1050,16 @@ class MCQGeneratorGUI(BaseMCQApp):
         for attempt, code_quiz_ids in attempts.items():
             sorted_items = sorted(code_quiz_ids, key=lambda item: self._student_sort_key(item[0]))
             question_pdf_paths = []
-            answer_pdf_paths = []
             for code, quiz_id in sorted_items:
                 question_pdf = os.path.join(
                     quiz_folder, f'attempt{attempt}', 'questions',
                     f"{artifact_id(quiz_id, 'Q')}.pdf"
                 )
-                answer_pdf = os.path.join(
-                    quiz_folder, f'attempt{attempt}', 'answers',
-                    f"{artifact_id(quiz_id, 'A')}.pdf"
-                )
                 if os.path.exists(question_pdf):
                     question_pdf_paths.append(question_pdf)
-                if os.path.exists(answer_pdf):
-                    answer_pdf_paths.append(answer_pdf)
             if not question_pdf_paths:
                 continue
-            group_name = artifact_id(format_quiz_id('Group', module_number, attempt), 'Q')
+            group_name = artifact_id(format_quiz_id(group_prefix, module_number, attempt), 'Q')
             group_path = os.path.join(quiz_folder, f'attempt{attempt}', 'questions', f'{group_name}.pdf')
             cover_path = os.path.join(quiz_folder, f'attempt{attempt}', 'questions', f'{group_name}_coversheet.pdf')
             self._build_coversheet_pdf(
@@ -973,13 +1071,9 @@ class MCQGeneratorGUI(BaseMCQApp):
 
             # Move component PDFs into subdirectories
             individual_question_dir = os.path.join(quiz_folder, f'attempt{attempt}', 'questions', 'Individual')
-            individual_answer_dir = os.path.join(quiz_folder, f'attempt{attempt}', 'answers', 'Individual_answer')
             os.makedirs(individual_question_dir, exist_ok=True)
-            os.makedirs(individual_answer_dir, exist_ok=True)
             for src in question_pdf_paths:
                 shutil.move(src, os.path.join(individual_question_dir, os.path.basename(src)))
-            for src in answer_pdf_paths:
-                shutil.move(src, os.path.join(individual_answer_dir, os.path.basename(src)))
 
             # Remove the temporary coversheet PDF
             try:
@@ -989,12 +1083,93 @@ class MCQGeneratorGUI(BaseMCQApp):
 
             print(f'[INFO] Created quiz packet: {group_path}')
 
+    def _next_single_packet_prefix(self, module_number: int, attempt: int,
+                                   packet_root: str) -> str:
+        '''Return the next unused 'All<letter>' prefix for a combined packet.'''
+        pattern = re.compile(
+            r'All([a-z])' + re.escape(f'{module_number:02d}_{attempt:04d}Q') + r'\.pdf$')
+        used = set()
+        if os.path.isdir(packet_root):
+            for _root, _dirs, files in os.walk(packet_root):
+                for f in files:
+                    m = pattern.match(f)
+                    if m:
+                        used.add(m.group(1))
+        for letter in 'abcdefghijklmnopqrstuvwxyz':
+            if letter not in used:
+                return f'All{letter}'
+        return 'All'
+
+    def _create_single_packet(self, created: Dict[str, List[str]], module_number: int,
+                              course_folder: str, title: str = 'Quiz Packet'):
+        '''Merge MCQ question PDFs from all sections into one packet per attempt.
+
+        Component files are looked up under each student's own section folder
+        and moved into that folder's questions/Individual directory. The merged
+        packet (with a single cover sheet listing all students) is written to
+        module{module_number}/quizzes/packets/attempt{attempt}/.
+        '''
+        packet_root = os.path.join(
+            course_folder, f'module{module_number}', 'quizzes', 'packets')
+        attempts: Dict[int, List[Tuple[str, str]]] = {}
+        for code, quiz_ids in created.items():
+            for quiz_id in quiz_ids:
+                try:
+                    attempt = int(quiz_id.split('_')[-1])
+                except ValueError:
+                    continue
+                attempts.setdefault(attempt, []).append((code, quiz_id))
+
+        for attempt, code_quiz_ids in sorted(attempts.items()):
+            sorted_items = sorted(code_quiz_ids, key=lambda item: self._student_sort_key(item[0]))
+            question_pdf_paths = []
+            for code, quiz_id in sorted_items:
+                section_number = self._section_for_code(code) or 0
+                quiz_folder = _module_quiz_folder(
+                    module_number, course_folder, section=section_number)
+                question_pdf = os.path.join(
+                    quiz_folder, f'attempt{attempt}', 'questions',
+                    f"{artifact_id(quiz_id, 'Q')}.pdf"
+                )
+                if os.path.exists(question_pdf):
+                    question_pdf_paths.append(question_pdf)
+                else:
+                    print(f'[WARNING] Quiz PDF not found for {quiz_id}: {question_pdf}')
+            if not question_pdf_paths:
+                continue
+
+            prefix = self._next_single_packet_prefix(module_number, attempt, packet_root)
+            group_name = artifact_id(format_quiz_id(prefix, module_number, attempt), 'Q')
+            out_dir = os.path.join(packet_root, f'attempt{attempt}')
+            group_path = os.path.join(out_dir, f'{group_name}.pdf')
+            cover_path = os.path.join(out_dir, f'{group_name}_coversheet.pdf')
+            self._build_coversheet_pdf(
+                title,
+                [code for code, _ in sorted_items],
+                cover_path,
+            )
+            self._merge_pdfs(question_pdf_paths, group_path, cover_pdf=cover_path)
+
+            # Move component PDFs into their own section's Individual directory
+            for src in question_pdf_paths:
+                individual_dir = os.path.join(os.path.dirname(src), 'Individual')
+                os.makedirs(individual_dir, exist_ok=True)
+                shutil.move(src, os.path.join(individual_dir, os.path.basename(src)))
+
+            try:
+                os.remove(cover_path)
+            except Exception:
+                pass
+
+            print(f'[INFO] Created combined quiz packet: {group_path}')
+
     def _create_quant_packets(self, main_files: List[str], answer_key_files: List[str],
                               student_codes: List[str], module: int, output_dir: str,
                               output_ids: Optional[Dict[str, str]] = None,
                               answer_key_output_ids: Optional[Dict[str, str]] = None,
                               title: str = 'Quant Packet',
-                              doc_type: str = 'Quiz'):
+                              doc_type: str = 'Quiz',
+                              group_prefix: str = 'Group'):
         '''Convert generated Quant ODTs to PDFs and merge into group packets.'''
         output_ids = output_ids or {}
         answer_key_output_ids = answer_key_output_ids or {}
@@ -1006,7 +1181,7 @@ class MCQGeneratorGUI(BaseMCQApp):
                     return f
             return None
 
-        sorted_codes = self._sort_codes_by_last_name(student_codes)
+        sorted_codes = self._sort_codes_by_second_name(student_codes)
 
         # Subdirectories for component ODT files
         main_odt_dir_name = 'worksheet_ODT' if doc_type == 'Worksheet' else 'quiz_ODT'
@@ -1025,7 +1200,7 @@ class MCQGeneratorGUI(BaseMCQApp):
                 main_pdfs.append(self._convert_odt_to_pdf(odt, output_dir, insert_blank_pages=(doc_type == 'Quiz')))
                 main_odt_paths.append(odt)
         if main_pdfs:
-            group_main_id = f"{format_quiz_id('Group', module, 1)}WS"
+            group_main_id = f"{format_quiz_id(group_prefix, module, 1)}WS"
             main_packet_path = os.path.join(output_dir, f'{group_main_id}.pdf')
             main_cover_path = os.path.join(output_dir, f'{group_main_id}_coversheet.pdf')
             self._build_coversheet_pdf(title, sorted_codes, main_cover_path)
@@ -1051,10 +1226,14 @@ class MCQGeneratorGUI(BaseMCQApp):
                 oid = answer_key_output_ids.get(code, code)
                 odt = _file_for_id(answer_key_files, oid)
                 if odt and os.path.exists(odt):
-                    ak_pdfs.append(self._convert_odt_to_pdf(odt, output_dir, insert_blank_pages=False))
+                    ak_pdfs.append(self._convert_odt_to_pdf(
+                        odt,
+                        output_dir,
+                        pad_to_even_pages=(doc_type == 'Worksheet'),
+                    ))
                     ak_odt_paths.append(odt)
             if ak_pdfs:
-                group_ak_id = f"{format_quiz_id('Group', module, 1)}WA"
+                group_ak_id = f"{format_quiz_id(group_prefix, module, 1)}WA"
                 ak_packet_path = os.path.join(output_dir, f'{group_ak_id}.pdf')
                 self._merge_pdfs(ak_pdfs, ak_packet_path)
 
@@ -1079,24 +1258,113 @@ class MCQGeneratorGUI(BaseMCQApp):
             if sec.get('ta_instructor'):
                 label += f' ({sec["ta_instructor"]})'
             self.section_filter_combo.addItem(label, sec['section_number'])
+        self._refresh_section_checkboxes()
+
+    def _refresh_section_checkboxes(self):
+        """Rebuild section checkboxes based on the current course_info."""
+        # Clear existing checkboxes
+        while self.section_checkboxes_layout.count():
+            item = self.section_checkboxes_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.section_checkboxes.clear()
+        try:
+            num_sections = get_course_info(self.engine).get('num_sections', 0) or 0
+        except Exception:
+            num_sections = 0
+        for sec_num in range(1, num_sections + 1):
+            cb = QCheckBox(f"S{sec_num}")
+            self.section_checkboxes[sec_num] = cb
+            self.section_checkboxes_layout.addWidget(cb)
+        if num_sections == 0:
+            self.section_checkboxes_layout.addWidget(QLabel("(no sections configured)"))
+
+    def _selected_section_numbers(self) -> List[int]:
+        """Return section numbers whose checkboxes are currently checked."""
+        return [sec_num for sec_num, cb in sorted(self.section_checkboxes.items()) if cb.isChecked()]
+
+    def _set_section_checkbox(self, sec_num: int, checked: bool = True):
+        """Check or uncheck the checkbox for a section, if it exists."""
+        cb = self.section_checkboxes.get(sec_num)
+        if cb is not None:
+            cb.setChecked(checked)
+
+    def _clear_section_checkboxes(self):
+        """Uncheck all section checkboxes."""
+        for cb in self.section_checkboxes.values():
+            cb.setChecked(False)
+
+    def _section_for_code(self, code: str) -> Optional[int]:
+        """Return the section number for a student code, or None."""
+        try:
+            student = get_student_by_code(self.engine, code)
+            if student is not None:
+                return student.section_number
+        except Exception:
+            pass
+        return None
+
+    def _group_codes_by_section(self, codes: List[str]) -> Dict[int, List[str]]:
+        """Group student codes by their assigned section number.
+
+        Codes with no assigned section go under section 0. Within each section
+        the codes are sorted by the student's second name (first surname).
+        """
+        groups: Dict[int, List[str]] = {}
+        for code in codes:
+            sec = self._section_for_code(code) or 0
+            groups.setdefault(sec, []).append(code)
+        for sec in groups:
+            groups[sec] = self._sort_codes_by_second_name(groups[sec])
+        return groups
+
+    def _next_packet_letter(self, section_number: int, module_number: int,
+                            course_folder: str) -> str:
+        """Return the next unused letter ('a'-'z') for a section packet name.
+
+        Scans existing packet PDFs under
+        module{module_number}/quizzes/section{section_number} for names like
+        S{section_number}<letter>{module:02d}_{attempt:04d}Q.pdf.
+        """
+        quiz_folder = _module_quiz_folder(module_number, course_folder, section=section_number)
+        prefix = f'S{section_number}'
+        pattern = re.compile(re.escape(prefix) + r'([a-z])\d{2}_\d{4}.*\.pdf$')
+        used = set()
+        for root, _, files in os.walk(quiz_folder):
+            for f in files:
+                m = pattern.match(f)
+                if m:
+                    used.add(m.group(1))
+        for letter in 'abcdefghijklmnopqrstuvwxyz':
+            if letter not in used:
+                return letter
+        return 'z'
+
+    def _update_section_checkboxes_from_codes(self):
+        """Check section boxes that correspond to the current student code list."""
+        self._clear_section_checkboxes()
+        text = self.student_codes_text.toPlainText().strip()
+        if not text:
+            return
+        for code in [c.strip() for c in text.split(',') if c.strip()]:
+            sec_num = self._section_for_code(code)
+            if sec_num is not None:
+                self._set_section_checkbox(sec_num, True)
 
     def populate_student_combo(self):
         """Populate the student combobox with names and codes from the database."""
         try:
             # Clear existing items
             self.student_combo.clear()
-        
-            # Get all students from the database
-            students = get_all_students(self.engine)
-            
-            # Sort students by student_code
-            students.sort(key=lambda student: student.student_code)
-        
+
+            # Get all students from the database, sorted by second name
+            students = sorted(get_all_students(self.engine), key=lambda s: student_name_sort_key(s.name))
+
             # Add each student to the combobox with format "Name (Code)"
             for student in students:
                 display_text = f"{student.name} ({student.student_code})"
                 self.student_combo.addItem(display_text, student.student_code)
-            
+
         except Exception as e:
             if 'no such table' not in str(e).lower():
                 print(f"Error populating student combo: {str(e)}")
@@ -1123,25 +1391,28 @@ class MCQGeneratorGUI(BaseMCQApp):
             
             # Update the text widget with the sorted, comma-separated list
             self.student_codes_text.setPlainText(", ".join(sorted(codes)))
-            
+            self._update_section_checkboxes_from_codes()
+
         except Exception as e:
             print(f"Error adding selected student: {str(e)}")
-    
+
     def add_all_students(self):
         """Add all student codes from the database to the student codes text widget."""
         try:
-            # Get all students from the database
-            students = get_all_students(self.engine)
-        
+            # Get all students from the database, sorted by second name
+            students = sorted(get_all_students(self.engine), key=lambda s: student_name_sort_key(s.name))
+
             # Extract all student codes
             codes = [student.student_code for student in students]
-        
+
             # Update the text widget with the sorted, comma-separated list
-            self.student_codes_text.setPlainText(", ".join(sorted(codes)))
-            
+            self.student_codes_text.setPlainText(", ".join(codes))
+            for cb in self.section_checkboxes.values():
+                cb.setChecked(True)
+
         except Exception as e:
             print(f"Error adding all students: {str(e)}")
-    
+
     def add_section_students(self):
         """Add student codes for the selected section to the student codes text widget."""
         try:
@@ -1151,7 +1422,9 @@ class MCQGeneratorGUI(BaseMCQApp):
                 return
             students = get_students_for_section(self.engine, sec_num)
             codes = [s.student_code for s in students]
-            self.student_codes_text.setPlainText(", ".join(sorted(codes)))
+            self.student_codes_text.setPlainText(", ".join(codes))
+            self._clear_section_checkboxes()
+            self._set_section_checkbox(sec_num, True)
         except Exception as e:
             print(f"Error adding section students: {str(e)}")
     
@@ -1842,18 +2115,25 @@ class MCQGeneratorGUI(BaseMCQApp):
         templates: Dict[str, str] = {}
         answers: Dict[str, str] = {}
         txts: Dict[str, str] = {}
+        display_names: Dict[str, str] = {}
         for f in files:
             m = template_re.match(f)
             if m:
-                templates[m.group(1)] = f
+                key = m.group(1).casefold()
+                templates[key] = f
+                display_names[key] = m.group(1)
                 continue
             m = answer_re.match(f)
             if m:
-                answers[m.group(1)] = f
+                key = m.group(1).casefold()
+                answers[key] = f
+                display_names.setdefault(key, m.group(1))
                 continue
             m = txt_re.match(f)
             if m:
-                txts[m.group(1)] = f
+                key = m.group(1).casefold()
+                txts[key] = f
+                display_names.setdefault(key, m.group(1))
 
         candidate_names = set(templates) | set(answers) | set(txts)
         matched_names = set(templates) & set(answers)
@@ -1882,31 +2162,31 @@ class MCQGeneratorGUI(BaseMCQApp):
                 have.append('Name_AnswerTemplate.odt')
             if name in txts:
                 have.append('Name.txt')
-            warn = (f"Template set '{name}' is incomplete (missing {', '.join(missing)}; "
+            warn = (f"Template set '{display_names[name]}' is incomplete (missing {', '.join(missing)}; "
                     f"has {', '.join(have)}). It will be ignored.")
             print(f"[WARNING] {warn}")
 
         if self.oneun_type_worksheet.isChecked() and len(matched_names) > 1:
             chosen = sorted(matched_names)[0]
             warn = (f"{len(matched_names)} template sets found for worksheets; "
-                    f"only the first ({chosen}) will be used. Place unused sets in a subfolder.")
+                    f"only the first ({display_names[chosen]}) will be used. Place unused sets in a subfolder.")
             print(f"[WARNING] {warn}")
             QMessageBox.warning(self, 'Multiple Template Sets', warn)
 
         self.oneun_definition_sets = []
         for name in sorted(matched_names):
             self.oneun_definition_sets.append({
-                'name': name,
+                'name': display_names[name],
                 'template_path': os.path.join(folder, templates[name]),
                 'answer_key_template_path': os.path.join(folder, answers[name]),
                 'def_path': os.path.join(folder, txts[name]) if name in txts else None,
             })
 
-        display_names = []
+        displayed_sets = []
         for name in sorted(matched_names):
             suffix = ' (+txt)' if name in txts else ' (no txt)'
-            display_names.append(name + suffix)
-        self.oneun_def_path.setText('; '.join(display_names))
+            displayed_sets.append(display_names[name] + suffix)
+        self.oneun_def_path.setText('; '.join(displayed_sets))
         self._oneun_def_loaded()
 
     def _oneun_get_params(self):
@@ -1954,6 +2234,7 @@ class MCQGeneratorGUI(BaseMCQApp):
                 instructors = ''
         metadata = {
             'doc_type': doc_type,
+            'module_number': module,
             'course': self.course_value or '',
             'instructors': instructors if isinstance(
                 instructors, str) else ', '.join(instructors or []),
@@ -2002,105 +2283,141 @@ class MCQGeneratorGUI(BaseMCQApp):
         (definition_sets, base_seed, metadata, plot_config,
          module, doc_type, course_folder) = params
 
-        set_info = definition_sets[0]
+        # Quizzes rotate through all matched template sets (3a, 3b, …) so each
+        # successive quiz in a section uses the next set.  Worksheets keep the
+        # first set only, matching the warning shown when several are present.
+        active_sets = definition_sets if doc_type == 'Quiz' else definition_sets[:1]
 
-        # Parse student codes
+        # Parse student codes and group by section for separate output folders/packets
         raw_codes = self.student_codes_text.toPlainText().strip()
         student_codes = [c.strip() for c in raw_codes.split(',') if c.strip()]
         if not student_codes:
             student_codes = ['']
 
-        # Build module-based worksheet IDs when a module is selected
-        output_ids: dict = {}
-        answer_key_output_ids: dict = {}
-        if module is not None:
-            for code in student_codes:
-                base = format_quiz_id(code, module, 1)
-                output_ids[code] = f"{base}WS"
-                answer_key_output_ids[code] = f"{base}WA"
-
-        # Resolve student codes to real names/section numbers for the ODT header
-        student_names: dict = {}
-        student_section_codes: dict = {}
-        try:
-            for row in get_all_students_as_dicts(self.engine):
-                if row.get('student_code') in student_codes:
-                    code = row['student_code']
-                    student_names[code] = row.get('name') or code
-                    section_number = row.get('section_number')
-                    student_section_codes[code] = str(section_number) if section_number is not None else ''
-        except Exception as e:
-            print(f"Warning: could not load student names: {e}")
-
+        code_groups = self._group_codes_by_section(student_codes)
         subdir = 'worksheets' if doc_type == 'Worksheet' else 'quizzes'
-        output_dir = os.path.join(course_folder, f'module{module}', subdir)
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, set_info['name'] + '.odt')
 
-        try:
-            odt_gen = OneUnODTGenerator()
-            main_files, answer_key_files, _ = odt_gen.generate_quiz(
-                definition=set_info['definition'],
-                template_path=set_info['template_path'],
-                output_path=output_path,
-                student_codes=student_codes,
-                quiz_metadata=metadata,
-                plot_config=plot_config,
-                output_ids=output_ids or None,
-                answer_key_template_path=set_info['answer_key_template_path'] or None,
-                answer_key_output_ids=answer_key_output_ids or None,
-                student_names=student_names or None,
-                student_section_codes=student_section_codes or None,
-                base_seed=base_seed,
-                return_values=True,
-            )
-            generated = main_files + answer_key_files
-            log_path = os.path.join(output_dir, set_info['name'] + '_summary.txt')
-            odt_gen._write_summary_log(
-                log_path=log_path,
-                definition_path=set_info['def_path'],
-                template_path=set_info['template_path'],
-                output_files=generated,
-                student_seeds={
-                    (sc or 'generic'): (base_seed + i if base_seed is not None else None)
-                    for i, sc in enumerate(student_codes)
-                },
-                metadata=metadata,
-                plot_config=plot_config,
-                generated_at=datetime.now().isoformat(timespec='seconds')
-            )
+        total_generated = 0
+        total_students = 0
+        section_output_dirs: List[str] = []
+        quiz_index = 0
 
-            if self.oneun_packet_checkbox.isChecked():
-                try:
-                    packet_title = 'Worksheet Packet' if doc_type == 'Worksheet' else 'Quant Quiz Packet'
-                    self._create_quant_packets(
-                        main_files, answer_key_files, student_codes, module, output_dir,
-                        output_ids=output_ids,
-                        answer_key_output_ids=answer_key_output_ids,
-                        title=packet_title,
-                        doc_type=doc_type,
+        for section_number, section_codes in sorted(code_groups.items()):
+            # Build module-based worksheet IDs for this section
+            output_ids: dict = {}
+            answer_key_output_ids: dict = {}
+            if module is not None:
+                for code in section_codes:
+                    base = format_quiz_id(code, module, 1)
+                    output_ids[code] = f"{base}WS"
+                    answer_key_output_ids[code] = f"{base}WA"
+
+            # Resolve student codes to real names/section numbers for the ODT header
+            student_names: dict = {}
+            student_section_codes: dict = {}
+            try:
+                for row in get_all_students_as_dicts(self.engine):
+                    if row.get('student_code') in section_codes:
+                        code = row['student_code']
+                        student_names[code] = row.get('name') or code
+                        sec_num = row.get('section_number')
+                        student_section_codes[code] = str(sec_num) if sec_num is not None else ''
+            except Exception as e:
+                print(f"Warning: could not load student names: {e}")
+
+            output_dir = os.path.join(course_folder, f'module{module}', subdir, f'section{section_number}')
+            os.makedirs(output_dir, exist_ok=True)
+            section_output_dirs.append(output_dir)
+
+            try:
+                odt_gen = OneUnODTGenerator()
+                main_files: List[str] = []
+                answer_key_files: List[str] = []
+                set_runs: Dict[str, Dict] = {}
+                for code in section_codes:
+                    # Round-robin the template sets across the whole run (not
+                    # per section) and offset the seed per quiz so every quiz
+                    # gets a different set of values.
+                    set_info = active_sets[quiz_index % len(active_sets)]
+                    seed = base_seed + quiz_index if base_seed is not None else None
+                    quiz_index += 1
+                    mf, akf, _ = odt_gen.generate_quiz(
+                        definition=set_info['definition'],
+                        template_path=set_info['template_path'],
+                        output_path=os.path.join(output_dir, set_info['name'] + '.odt'),
+                        student_codes=[code],
+                        quiz_metadata=metadata,
+                        plot_config=plot_config,
+                        output_ids=output_ids or None,
+                        answer_key_template_path=set_info['answer_key_template_path'] or None,
+                        answer_key_output_ids=answer_key_output_ids or None,
+                        student_names=student_names or None,
+                        student_section_codes=student_section_codes or None,
+                        base_seed=seed,
+                        return_values=True,
                     )
-                except Exception as pkt_err:
-                    print(f"[ERROR] Failed to create quant packet: {pkt_err}")
-                    import traceback
-                    traceback.print_exc()
+                    run = set_runs.setdefault(set_info['name'], {
+                        'def_path': set_info['def_path'],
+                        'template_path': set_info['template_path'],
+                        'files': [], 'seeds': {}})
+                    run['files'].extend(mf + akf)
+                    run['seeds'][code or 'generic'] = seed
+                    main_files.extend(mf)
+                    answer_key_files.extend(akf)
 
-            QMessageBox.information(
-                self, "Success",
-                f"Generated {len(generated)} {doc_type.lower()} file(s).\n\n"
-                f"Set: {set_info['name']}\n"
-                f"Equations (questions): {len(set_info['definition'].equations)}\n"
-                f"Students: {len(student_codes)}\n"
-                f"Base seed: {base_seed}\n"
-                f"Output folder: {output_dir}\n\n"
-                f"Summary log written alongside output files.")
-            self.statusBar().showMessage(
-                f"OneUn: {len(generated)} {doc_type.lower()}(s) saved", 5000)
+                generated = main_files + answer_key_files
+                total_generated += len(generated)
+                total_students += len(section_codes)
 
-        except Exception as e:
-            print(f"\n[ERROR] OneUn generation failed: {e}")
-            import traceback
-            traceback.print_exc()
+                for set_name, run in set_runs.items():
+                    odt_gen._write_summary_log(
+                        log_path=os.path.join(output_dir, set_name + '_summary.txt'),
+                        definition_path=run['def_path'],
+                        template_path=run['template_path'],
+                        output_files=run['files'],
+                        student_seeds=run['seeds'],
+                        metadata=metadata,
+                        plot_config=plot_config,
+                        generated_at=datetime.now().isoformat(timespec='seconds')
+                    )
+
+                if self.oneun_packet_checkbox.isChecked():
+                    try:
+                        letter = self._next_packet_letter(section_number, module, course_folder)
+                        group_prefix = f'S{section_number}{letter}'
+                        packet_title = (
+                            f"{'Worksheet' if doc_type == 'Worksheet' else 'Quant Quiz'} Packet "
+                            f"(Section {section_number})"
+                        )
+                        self._create_quant_packets(
+                            main_files, answer_key_files, section_codes, module, output_dir,
+                            output_ids=output_ids,
+                            answer_key_output_ids=answer_key_output_ids,
+                            title=packet_title,
+                            doc_type=doc_type,
+                            group_prefix=group_prefix,
+                        )
+                    except Exception as pkt_err:
+                        print(f"[ERROR] Failed to create quant packet: {pkt_err}")
+                        import traceback
+                        traceback.print_exc()
+
+            except Exception as e:
+                print(f"\n[ERROR] OneUn generation failed for section {section_number}: {e}")
+                import traceback
+                traceback.print_exc()
+
+        output_dir_list = ', '.join(section_output_dirs)
+        QMessageBox.information(
+            self, "Success",
+            f"Generated {total_generated} {doc_type.lower()} file(s).\n\n"
+            f"Sets: {', '.join(s['name'] for s in active_sets)}\n"
+            f"Students: {total_students}\n"
+            f"Base seed: {base_seed}\n"
+            f"Output folders: {output_dir_list}\n\n"
+            f"Summary logs written alongside output files.")
+        self.statusBar().showMessage(
+            f"OneUn: {total_generated} {doc_type.lower()}(s) saved", 5000)
 
 
     # ------------------------------------------------------------------
@@ -2128,6 +2445,17 @@ class MCQGeneratorGUI(BaseMCQApp):
                 'studentCodes', self.student_codes_text.toPlainText()))
         layout.addWidget(self.student_codes_text)
 
+        # Section checkboxes track which sections are represented in the code list.
+        # They are used for naming generated group packets.
+        self.section_checkboxes_layout = QHBoxLayout()
+        self.section_checkboxes: Dict[int, QCheckBox] = {}
+        self._refresh_section_checkboxes()
+        section_cb_row = QHBoxLayout()
+        section_cb_row.addWidget(QLabel("Sections represented:"))
+        section_cb_row.addLayout(self.section_checkboxes_layout)
+        section_cb_row.addStretch()
+        layout.addLayout(section_cb_row)
+
         sel_row = QHBoxLayout()
         self.student_combo = QComboBox()
         self.populate_student_combo()
@@ -2151,7 +2479,10 @@ class MCQGeneratorGUI(BaseMCQApp):
         sel_row.addWidget(section_btn)
 
         clear_btn = QPushButton("Clear")
-        clear_btn.clicked.connect(lambda: self.student_codes_text.clear())
+        def _clear_student_codes():
+            self.student_codes_text.clear()
+            self._clear_section_checkboxes()
+        clear_btn.clicked.connect(_clear_student_codes)
         sel_row.addWidget(clear_btn)
 
         layout.addLayout(sel_row)

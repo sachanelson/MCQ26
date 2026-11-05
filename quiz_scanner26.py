@@ -408,7 +408,7 @@ def extract_quiz_id_from_qr(image: np.ndarray) -> Optional[str]:
         return None
 
 
-def extract_quiz_id_and_page_from_qr(image: np.ndarray) -> Tuple[Optional[str], Optional[int]]:
+def extract_quiz_id_and_page_from_qr(image: np.ndarray, quiet: bool = False) -> Tuple[Optional[str], Optional[int]]:
     """Decode a QR code and split its raw content into (quiz_id, page_number).
 
     MCQ26 encodes every page's QR as '{quiz_id}|{page_number}' (see
@@ -424,7 +424,7 @@ def extract_quiz_id_and_page_from_qr(image: np.ndarray) -> Tuple[Optional[str], 
     try:
         from qr_detector26 import decode_raw_qr_data
         gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY) if len(image.shape) == 3 else image
-        raw = decode_raw_qr_data(gray)
+        raw = decode_raw_qr_data(gray, quiet=quiet)
     except Exception as e:
         logger.error(f"Error decoding QR code: {str(e)}")
         return None, None
@@ -611,7 +611,27 @@ def group_pages_by_quiz_id(pages: List[QuizPage]) -> List[List[QuizPage]]:
         # happen once quiz_id decoded) sort after known ones, in scan order.
         return (page.quiz_page_number is None, page.quiz_page_number, page.page_number)
 
-    groups = [sorted(by_quiz_id[qid], key=_sort_key) for qid in order]
+    groups = []
+    for qid in order:
+        sorted_pages = sorted(by_quiz_id[qid], key=_sort_key)
+        # A sheet scanned more than once produces multiple pages with the
+        # same in-quiz page number, which sort adjacent to each other. Each
+        # extra copy would then shift every later page out of alignment
+        # with the quiz's metadata and silently mis-grade the quiz, so keep
+        # only the first occurrence of each page number.
+        seen_page_numbers = set()
+        deduped = []
+        for page in sorted_pages:
+            if page.quiz_page_number is not None:
+                if page.quiz_page_number in seen_page_numbers:
+                    logger.warning(
+                        f"Ignoring duplicate scan of page {page.quiz_page_number} "
+                        f"of quiz {qid} (scan page {page.page_number})"
+                    )
+                    continue
+                seen_page_numbers.add(page.quiz_page_number)
+            deduped.append(page)
+        groups.append(deduped)
     groups.extend(unresolved)
 
     logger.info(

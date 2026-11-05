@@ -28,6 +28,7 @@ from pypdf import PdfReader, PdfWriter
 from database26 import (
     Student, Quiz, get_course_info, get_student_by_code, get_section,
     add_generated_quiz_attempt, get_student_module_question_ids, quiz_attempt_exists,
+    quiz_id_exists,
 )
 from document_ids26 import artifact_id, format_quiz_id
 from quiz_bank_parser26 import load_question_banks
@@ -173,16 +174,22 @@ class QuizPDF(FPDF):
             if page not in self.metadata:
                 self.metadata[page] = {"qr_code": None, "questions": [], "calibration_points": {}}
 
-        self.set_font('Helvetica', 'B', 12)
+        title_text = quiz_type
+        title_size = 12
+        if quiz_type == 'Quiz' and getattr(self, 'module_num', None):
+            title_text = f'Module {self.module_num} Quiz'
+            title_size = 14
+
+        self.set_font('Helvetica', 'B', title_size)
         y_title = self.get_y() + 2
         printable_w = self.w - self.l_margin - self.r_margin
-        title_w = self.get_string_width(quiz_type)
+        title_w = self.get_string_width(title_text)
         title_left_x = self.l_margin + max((printable_w - title_w) / 2, 0)
         label_x = title_left_x + title_w + 3
 
         if self.page_no() == 1 and self.course is not None:
             self.ln(2)
-            self.cell(0, 8, quiz_type, align='C', ln=1)
+            self.cell(0, 8, title_text, align='C', ln=1)
             if getattr(self, 'quiz_id', None):
                 prev_x, prev_y = self.get_x(), self.get_y()
                 self.set_font('Helvetica', '', 8)
@@ -353,9 +360,17 @@ class QuizPDF(FPDF):
 # Quiz creation API
 # ---------------------------------------------------------------------------
 
-def _module_quiz_folder(module_number: int, course_folder: str) -> str:
-    """Return and create the module quizzes folder."""
-    folder = os.path.join(course_folder, f'module{module_number}', 'quizzes')
+def _module_quiz_folder(module_number: int, course_folder: str, section: Optional[int] = None) -> str:
+    """Return and create the module quizzes folder.
+
+    When *section* is provided the folder includes a section{N} subdirectory,
+    e.g. module{N}/quizzes/section{S}.  A section of 0 is used for students
+    without an assigned section.
+    """
+    parts = [course_folder, f'module{module_number}', 'quizzes']
+    if section is not None:
+        parts.append(f'section{section}')
+    folder = os.path.join(*parts)
     os.makedirs(folder, exist_ok=True)
     return folder
 
@@ -374,13 +389,24 @@ def _find_start_attempt(
     module_number: int,
     needed: int,
 ) -> int:
-    """Return the first attempt number for which `needed` consecutive attempts are free."""
+    """Return the first attempt number for which `needed` consecutive attempts are free.
+
+    An attempt slot is occupied if the quiz_id exists in the database under
+    ANY student: quizzes transferred to another student during grading still
+    own the printed quiz_id, and regenerating it would overwrite graded
+    artifacts and violate the (quiz_id, question_number) uniqueness of
+    quiz_questions.
+    """
     attempt = 1
     while True:
         if all(
             not quiz_attempt_exists(
                 engine, student_id, module_number,
                 format_quiz_id(student_code, module_number, attempt + i)
+            )
+            and not quiz_id_exists(
+                engine,
+                format_quiz_id(student_code, module_number, attempt + i),
             )
             for i in range(needed)
         ):
@@ -529,10 +555,7 @@ def create_quiz_pdf(questions, output_file, is_answer_key=False, course=None, in
     pdf.output(output_file)
 
     output_dir = os.path.dirname(output_file)
-    if is_answer_key:
-        metadata_dir = output_dir
-    else:
-        metadata_dir = os.path.normpath(os.path.join(output_dir, os.pardir, 'JSON'))
+    metadata_dir = os.path.normpath(os.path.join(output_dir, os.pardir, 'JSON'))
     os.makedirs(metadata_dir, exist_ok=True)
     letter = 'A' if is_answer_key else 'Q'
     basename = os.path.basename(output_file)
@@ -587,7 +610,6 @@ def create_quizzes_for_students(
                 f"Bank {os.path.basename(bank_path)} requested {n} questions but only has {len(questions)}"
             )
 
-    quiz_folder = _module_quiz_folder(module_number, course_folder)
     created: Dict[str, List[str]] = {}
     first_bank_path = next(iter(bank_questions)) if bank_questions else ''
     first_bank_name = os.path.basename(first_bank_path) if first_bank_path else ''
@@ -623,18 +645,21 @@ def create_quizzes_for_students(
             )
             quiz_questions = _prepare_quiz_questions(selected)
 
+            section_number = student.section_number if student.section_number is not None else 0
             section_code = ''
-            if student.section_number is not None:
-                sec = get_section(engine, student.section_number)
-                if sec:
-                    section_code = sec.get('code', '')
+            sec = get_section(engine, section_number)
+            if sec:
+                section_code = sec.get('code', '')
 
+            quiz_folder = _module_quiz_folder(module_number, course_folder, section=section_number)
             attempt_folder = os.path.join(quiz_folder, f'attempt{attempt}')
             attempt_quiz_folder = os.path.join(attempt_folder, 'questions')
-            attempt_key_folder = os.path.join(attempt_folder, 'answers')
+            attempt_key_folder = os.path.join(attempt_folder, 'answers', 'MCQ')
+            attempt_answer_json_folder = os.path.join(attempt_folder, 'answers', 'JSON')
             attempt_json_folder = os.path.join(attempt_folder, 'JSON')
             os.makedirs(attempt_quiz_folder, exist_ok=True)
             os.makedirs(attempt_key_folder, exist_ok=True)
+            os.makedirs(attempt_answer_json_folder, exist_ok=True)
             os.makedirs(attempt_json_folder, exist_ok=True)
 
             quiz_pdf_path = os.path.join(attempt_quiz_folder, f"{artifact_id(quiz_id, 'Q')}.pdf")
@@ -724,52 +749,64 @@ def pdf_page_count(pdf_path: str) -> int:
     return len(PdfReader(pdf_path).pages)
 
 
-def stamp_page_numbers_to_pdf(pdf_path: str, total_pages: Optional[int] = None) -> int:
-    """Stamp 'current:total' centered on every page of a PDF, in place.
+def stamp_page_numbers_to_pdf(
+    pdf_path: str,
+    total_pages: Optional[int] = None,
+    labels: Optional[List[str]] = None,
+) -> int:
+    """Stamp 'current:total' (or custom labels) centered on every page of a PDF, in place.
 
-    If total_pages is not provided, the PDF's own page count is used.
+    If *labels* is provided it must contain one label per page and is used
+    verbatim. Otherwise each page is stamped with its 1-based page index and
+    *total_pages* (defaulting to the PDF's own page count).
     """
     reader = PdfReader(pdf_path)
     n = len(reader.pages)
-    if total_pages is None:
-        total_pages = n
-    labels = [f'{i}:{total_pages}' for i in range(1, n + 1)]
+    if labels is None:
+        if total_pages is None:
+            total_pages = n
+        labels = [f'{i}:{total_pages}' for i in range(1, n + 1)]
+    elif len(labels) != n:
+        raise ValueError(f'Expected {n} labels, got {len(labels)}')
 
-    # Match the overlay's page size to the actual PDF being stamped (points -> mm),
-    # rather than assuming a fixed paper size, so the stamp lands in the right place
-    # regardless of what format the source PDF was authored in.
-    mediabox = reader.pages[0].mediabox
     pt_to_mm = 25.4 / 72.0
-    page_width_mm = float(mediabox.width) * pt_to_mm
-    page_height_mm = float(mediabox.height) * pt_to_mm
-
-    overlay = FPDF(orientation='P', unit='mm', format=(page_width_mm, page_height_mm))
-    overlay.set_auto_page_break(False)
-    for label in labels:
-        overlay.add_page()
-        overlay.set_font('Helvetica', '', 10)
-        overlay.set_y(overlay.h - 15)
-        overlay.cell(0, 10, label, align='C')
-    overlay_bytes = bytes(overlay.output())
-    overlay_reader = PdfReader(io.BytesIO(overlay_bytes))
-
+    overlays = {}
     writer = PdfWriter()
-    for i, page in enumerate(reader.pages):
-        page.merge_page(overlay_reader.pages[i])
+    for page, label in zip(reader.pages, labels):
+        width_pt = float(page.mediabox.width)
+        height_pt = float(page.mediabox.height)
+        key = (round(width_pt, 3), round(height_pt, 3), label)
+        if key not in overlays:
+            overlay = FPDF(
+                orientation='P' if width_pt <= height_pt else 'L',
+                unit='mm',
+                format=(width_pt * pt_to_mm, height_pt * pt_to_mm),
+            )
+            overlay.set_auto_page_break(False)
+            overlay.add_page()
+            overlay.set_font('Helvetica', '', 10)
+            overlay.set_y(overlay.h - 15)
+            overlay.cell(0, 10, label, align='C')
+            overlays[key] = PdfReader(io.BytesIO(bytes(overlay.output()))).pages[0]
+        page.merge_page(overlays[key])
         writer.add_page(page)
 
     tmp_path = pdf_path + '.tmp_pages'
     with open(tmp_path, 'wb') as f:
         writer.write(f)
     os.replace(tmp_path, pdf_path)
-    return total_pages
+    return total_pages if total_pages is not None else n
 
 
 def list_module_quizzes(module_number: int, course_folder: str) -> List[str]:
-    """Return a list of quiz PDF paths for a module."""
+    """Return a list of quiz PDF paths for a module.
+
+    Searches the module quizzes folder and any section{N} subdirectories.
+    """
     quiz_folder = _module_quiz_folder(module_number, course_folder)
-    return sorted(
-        os.path.join(quiz_folder, f)
-        for f in os.listdir(quiz_folder)
-        if f.endswith('Q.pdf')
-    )
+    paths: List[str] = []
+    for root, _, files in os.walk(quiz_folder):
+        for f in files:
+            if f.endswith('Q.pdf'):
+                paths.append(os.path.join(root, f))
+    return sorted(paths)

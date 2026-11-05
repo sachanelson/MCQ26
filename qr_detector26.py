@@ -240,10 +240,44 @@ def _trim_extra_digit(quiz_id):
     
     return quiz_id
 
-# Global threshold value to be reused across pages
+# Global threshold value to be reused across pages of one scan batch.
+# Call reset_qr_threshold() when starting a new scan file so a threshold
+# computed from one batch's contrast is not applied to the next.
 _qr_threshold = None
 
-def decode_raw_qr_data(image):
+
+def reset_qr_threshold():
+    """Forget the cached binarisation threshold so the next page recomputes it."""
+    global _qr_threshold
+    _qr_threshold = None
+
+def _try_qr_decoders(region):
+    """Try pyzbar then OpenCV on a single prepared (binary or grayscale) region."""
+    try:
+        with suppress_stderr():
+            decoded_objects = pyzbar_decode(region)
+        if decoded_objects:
+            for obj in decoded_objects:
+                try:
+                    data = obj.data.decode('utf-8', errors='ignore')
+                    if data:
+                        return data
+                except Exception as e:
+                    logger.debug(f"QR(pyzbar) decode object error: {e}")
+    except Exception as e:
+        logger.debug(f"QR(pyzbar) exception: {e}")
+
+    try:
+        qrd = cv2.QRCodeDetector()
+        data, points, _ = qrd.detectAndDecode(region)
+        if data:
+            return data
+    except Exception as e:
+        logger.debug(f"QR(opencv) exception: {e}")
+    return None
+
+
+def decode_raw_qr_data(image, quiet=False):
     """Decode the raw string content of a QR code in the lower-right corner.
 
     This is the shared crop/threshold/decode logic used by
@@ -263,6 +297,9 @@ def decode_raw_qr_data(image):
     if image is None or image.size == 0 or image.max() == image.min():
         logger.error("Image appears to be empty or invalid")
         return None
+
+    if image.ndim == 3:
+        image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
 
     # Extract the lower right corner region where QR code is expected
     height, width = image.shape[:2]
@@ -284,35 +321,40 @@ def decode_raw_qr_data(image):
 
     _, qr_region_binary = cv2.threshold(qr_region, _qr_threshold, 255, cv2.THRESH_BINARY)
 
-    # Try pyzbar on binary region only
-    try:
-        with suppress_stderr():
-            decoded_objects = pyzbar_decode(qr_region_binary)
-        if decoded_objects:
-            logger.info(f"QR(pyzbar): decoded {len(decoded_objects)} object(s) in lower-right region")
-            for obj in decoded_objects:
-                try:
-                    data = obj.data.decode('utf-8', errors='ignore')
-                    if data:
-                        return data
-                except Exception as e:
-                    logger.debug(f"QR(pyzbar) decode object error: {e}")
-        else:
-            logger.info("QR(pyzbar): no decoded objects in lower-right region")
-    except Exception as e:
-        logger.debug(f"QR(pyzbar) exception: {e}")
+    data = _try_qr_decoders(qr_region_binary)
+    if data:
+        logger.info("QR decoded in lower-right region (global threshold)")
+        return data
 
-    # Try OpenCV on binary region only
-    try:
-        qrd = cv2.QRCodeDetector()
-        data, points, _ = qrd.detectAndDecode(qr_region_binary)
+    # Fallbacks: the shared threshold is computed from the first page of a
+    # batch and may not suit a later scan's contrast, and a skewed scan can
+    # push the QR partly outside the expected corner.  Retry with a
+    # per-region Otsu threshold, the raw grayscale region, a wider crop, and
+    # finally the whole page before declaring the page QR-free.
+    _, otsu_region = cv2.threshold(qr_region, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    for candidate in (otsu_region, qr_region):
+        data = _try_qr_decoders(candidate)
         if data:
+            logger.info("QR decoded in lower-right region (fallback variant)")
             return data
-        logger.info("QR(opencv): no decoded data in lower-right region")
-    except Exception as e:
-        logger.debug(f"QR(opencv) exception: {e}")
 
-    logger.error("No QR codes detected with any method for this page region")
+    wider_region = image[int(height * 0.55):, int(width * 0.5):]
+    _, wider_binary = cv2.threshold(wider_region, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    for candidate in (wider_binary, wider_region):
+        data = _try_qr_decoders(candidate)
+        if data:
+            logger.info("QR decoded in widened lower-right region")
+            return data
+
+    _, full_binary = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    for candidate in (full_binary, image):
+        data = _try_qr_decoders(candidate)
+        if data:
+            logger.info("QR decoded on full page")
+            return data
+
+    if not quiet:
+        logger.error("No QR codes detected with any method for this page")
     return None
 
 

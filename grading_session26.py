@@ -7,18 +7,17 @@ date:
 
     <course_folder>/grading/<session_date>/<session_date><letter>/
 
-Each session directory holds an archived copy of the scan file plus any
-per-quiz artifacts written during grading (see grading26.save_grading_artifacts
-and the 'unresolved' subfolder for scans whose QR code couldn't be read).
+Each session directory holds generated grading artifacts (see
+grading26.save_grading_artifacts and the 'unresolved' subfolder for scans
+whose QR code couldn't be read). Original scan files remain in place.
 
 For now, the linkage between qsessions (when quizzes were administered) and
 grading sessions (when they were scanned/graded) is tracked manually by
 staff; this module only manages the grading-session bookkeeping itself.
 """
-import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Union
 
 from database26 import create_grading_session, get_grading_sessions
 
@@ -47,15 +46,15 @@ def next_letter(engine, session_date: str) -> str:
 def start_grading_session(
     engine,
     course_folder: str,
-    scan_path: str,
+    scan_path: Union[str, List[str]],
     session_date: Optional[str] = None,
 ) -> Dict:
     """Start a new grading session for *scan_path*.
 
     Assigns the next available date/letter, creates the session directory,
-    archives a copy of the scan file into it, and records the session in the
-    database. Returns a dict with the GradingSession fields plus a
-    'directory' key (Path) for the session's on-disk folder.
+    and records the session in the database. Returns a dict with the
+    GradingSession fields plus a 'directory' key (Path) for the session's
+    on-disk folder.
     """
     if not course_folder:
         raise ValueError('Course folder is not set. Set it in Course Info first.')
@@ -66,16 +65,15 @@ def start_grading_session(
     directory = session_directory(course_folder, session_date, letter)
     directory.mkdir(parents=True, exist_ok=True)
 
-    scan_source = Path(scan_path)
-    archived_scan = directory / scan_source.name
-    shutil.copy2(scan_source, archived_scan)
-
+    scan_paths = [scan_path] if isinstance(scan_path, str) else list(scan_path)
+    if not scan_paths:
+        raise ValueError('At least one scan PDF is required.')
     info = create_grading_session(
         engine,
         session_date=session_date,
         letter=letter,
-        scan_path=str(archived_scan),
-        original_scan_filename=scan_source.name,
+        scan_path=str(directory),
+        original_scan_filename=', '.join(Path(path).name for path in scan_paths),
     )
     info['directory'] = directory
     return info

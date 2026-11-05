@@ -17,7 +17,7 @@ from sqlalchemy import (
     UniqueConstraint, desc, event, func, create_engine, text
 )
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import declarative_base, relationship, Session, sessionmaker, scoped_session
+from sqlalchemy.orm import declarative_base, joinedload, relationship, Session, sessionmaker, scoped_session
 
 logger = logging.getLogger(__name__)
 
@@ -82,13 +82,14 @@ class CourseInfo(Base):
     first_segment_count      = Column(Integer, nullable=True,  default=4)        # number of required first-segment modules
     max_attempts_per_module  = Column(Integer, nullable=True,  default=4)        # default max attempts per module
     passing_threshold        = Column(Float,   nullable=True, default=65.0)         # minimum score to pass a quiz
-    completion_threshold     = Column(Float,   nullable=True, default=90.0)         # minimum score to complete a module
     # Class meeting info (whole-course level)
-    class_days       = Column(String,  nullable=True, default='T,Th')   # comma-separated: M,T,W,Th,F
-    class_start_time = Column(String,  nullable=True, default='15:55')  # HH:MM 24-hr
-    class_end_time   = Column(String,  nullable=True, default='17:15')  # HH:MM 24-hr
-    class_classroom  = Column(String,  nullable=True, default='')       # e.g. Abelson-Bass 131
-    num_sections     = Column(Integer, nullable=True, default=0)
+    class_days         = Column(String,  nullable=True, default='T,Th')   # comma-separated: M,T,W,Th,F
+    class_start_time   = Column(String,  nullable=True, default='15:55')  # HH:MM 24-hr
+    class_end_time     = Column(String,  nullable=True, default='17:15')  # HH:MM 24-hr
+    class_classroom      = Column(String,  nullable=True, default='')       # e.g. Abelson-Bass 131
+    section_first_day    = Column(String,  nullable=True, default='')     # YYYY-MM-DD, first section meeting
+    section_meeting_count = Column(Integer, nullable=True, default=12)     # max section meetings per section
+    num_sections         = Column(Integer, nullable=True, default=0)
 
     def __repr__(self):
         return f"<CourseInfo(course='{self.course}', folder='{self.course_folder}')>"
@@ -182,7 +183,6 @@ class Student(Base):
     # Relationships (mirrors old schema; signup table added later)
     module_progress = relationship("StudentModuleProgress", back_populates="student", cascade="all, delete-orphan")
     quizzes         = relationship("Quiz", back_populates="student", cascade="all, delete-orphan")
-    session_signups = relationship("SessionSignup", back_populates="student", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<Student(name='{self.name}', code='{self.student_code}', section={self.section_number})>"
@@ -215,6 +215,10 @@ class Quiz(Base):
     odt_template_path  = Column(String, nullable=True, default='')
     odt_variable_names_json = Column(Text, nullable=True, default='[]')
     odt_variable_values_json = Column(Text, nullable=True, default='[]')
+    mcq_points_earned   = Column(Float, nullable=True)
+    mcq_points_possible = Column(Float, nullable=True)
+    quant_points_earned = Column(Float, nullable=True)
+    quant_total_points  = Column(Float, nullable=True, default=0.0)
     grading_session_id = Column(Integer, ForeignKey('grading_sessions.grading_session_id', ondelete='SET NULL'), nullable=True)
 
     student = relationship("Student", back_populates="quizzes")
@@ -242,6 +246,18 @@ class QuizQuestion(Base):
     __table_args__ = (
         UniqueConstraint('quiz_id', 'question_number', name='uq_quiz_question_position'),
     )
+
+
+class QuizRegrade(Base):
+    __tablename__ = 'quiz_regrades'
+
+    regrade_id = Column(Integer, primary_key=True)
+    quiz_id = Column(Integer, ForeignKey('quizzes.id', ondelete='CASCADE'), nullable=False, index=True)
+    previous_score = Column(Integer, nullable=True)
+    new_score = Column(Integer, nullable=False)
+    student_answers_json = Column(Text, nullable=False, default='{}')
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.now)
 
 
 class SectionMeeting(Base):
@@ -283,24 +299,56 @@ class SectionMeetingGrade(Base):
 
     __table_args__ = (
         UniqueConstraint('section_meeting_id', 'student_id', name='uq_section_meeting_student'),
-        CheckConstraint('score IS NULL OR score BETWEEN 0 AND 2', name='ck_section_meeting_grade_score'),
+    )
+
+
+class LectureMeeting(Base):
+    """One row per whole-class lecture meeting."""
+    __tablename__ = 'lecture_meetings'
+
+    meeting_id        = Column(Integer, primary_key=True)
+    meeting_date      = Column(String, nullable=False)
+    start_time        = Column(String, nullable=True)
+    end_time          = Column(String, nullable=True)
+    meeting_sequence  = Column(Integer, nullable=False)
+    title             = Column(String, nullable=True)
+    created_at        = Column(DateTime, server_default=func.now())
+    updated_at        = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('meeting_date', 'start_time', name='uq_lecture_meeting_time'),
+        UniqueConstraint('meeting_sequence', name='uq_lecture_meeting_sequence'),
+    )
+
+
+class LectureParticipation(Base):
+    """Participation score for a student at a specific lecture meeting."""
+    __tablename__ = 'lecture_participation'
+
+    participation_id   = Column(Integer, primary_key=True)
+    lecture_meeting_id = Column(Integer, ForeignKey('lecture_meetings.meeting_id', ondelete='CASCADE'), nullable=False)
+    student_id         = Column(Integer, ForeignKey('students.student_id', ondelete='CASCADE'), nullable=False)
+    score              = Column(Integer, nullable=True)
+    note               = Column(Text, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint('lecture_meeting_id', 'student_id', name='uq_lecture_participation'),
     )
 
 
 class StudentModuleProgress(Base):
     """Tracks a student's progress in a specific module.
 
-    Simplified status model: one row per student/module records whether the
-    module is completed, the highest score, and the number of attempts used.
-    Eligibility for the second segment is derived from completion of the first
-    N modules (where N = course_info.first_segment_count).
+    Simplified status model: one row per student/module records the highest
+    score and the number of attempts used. Students may take a quiz up to
+    max_attempts_per_module times (or more, if manually overridden) - there
+    is no "completion" state.
     """
     __tablename__ = 'student_module_progress'
 
     id            = Column(Integer, primary_key=True)
     student_id    = Column(Integer, ForeignKey('students.student_id', ondelete='CASCADE'), nullable=False)
     module_number = Column(Integer, ForeignKey('modules.number', ondelete='CASCADE'), nullable=False)
-    completed     = Column(Boolean, default=False)  # module completed?
     highest_score = Column(Float, default=0.0)
     attempts_count = Column(Integer, default=0)     # how many attempts used (max enforced elsewhere)
     last_attempt  = Column(DateTime, nullable=True)
@@ -315,7 +363,7 @@ class StudentModuleProgress(Base):
 
     def __repr__(self):
         return (f"<StudentModuleProgress(student_id={self.student_id}, module_number={self.module_number}, "
-                f"completed={self.completed}, attempts={self.attempts_count}, score={self.highest_score})>")
+                f"attempts={self.attempts_count}, score={self.highest_score})>")
 
 
 class QuizSession(Base):
@@ -345,30 +393,12 @@ class QuizSession(Base):
                 f"date='{self.date}', time='{self.start_time}-{self.end_time}')>")
 
 
-class SessionSignup(Base):
-    __tablename__ = 'session_signups'
-
-    signup_id = Column(Integer, primary_key=True)
-    session_id = Column(Integer, ForeignKey('quiz_sessions.session_id', ondelete='CASCADE'), nullable=False)
-    student_id = Column(Integer, ForeignKey('students.student_id', ondelete='CASCADE'), nullable=False)
-    module_number = Column(Integer, nullable=False)
-    quiz_id = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.now)
-
-    student = relationship("Student", back_populates="session_signups")
-    session = relationship("QuizSession")
-
-    __table_args__ = (
-        UniqueConstraint('session_id', 'student_id', 'quiz_id', name='uq_session_signup_quiz'),
-    )
-
-
 class GradingSession(Base):
     """Represents one grading session: grading a single scanned batch of quizzes.
 
     Sessions are organized by date plus a letter suffix ('a', 'b', 'c', ...)
-    for multiple scans graded on the same date. The archived scan file lives
-    under `<course_folder>/grading/<session_date>/<session_date><letter>/`.
+    for multiple scans graded on the same date. Generated grading artifacts
+    live under `<course_folder>/grading/<session_date>/<session_date><letter>/`.
 
     For now, the linkage between qsessions (when quizzes were administered)
     and grading sessions (when they were scanned/graded) is tracked manually
@@ -379,7 +409,7 @@ class GradingSession(Base):
     grading_session_id     = Column(Integer, primary_key=True)
     session_date           = Column(String, nullable=False)   # YYYY-MM-DD
     letter                 = Column(String(1), nullable=False)
-    scan_path              = Column(String, nullable=False)   # archived copy of the scan file
+    scan_path              = Column(String, nullable=False)   # grading session directory
     original_scan_filename = Column(String, nullable=True)
     notes                  = Column(Text, nullable=True)
     created_at             = Column(DateTime, default=datetime.now)
@@ -460,6 +490,7 @@ def create_db_engine(db_path: str = None) -> Engine:
     _migrate_add_columns(engine)
     _migrate_student_module_progress(engine)
     _migrate_quiz_questions(engine)
+    _migrate_section_meeting_grades(engine)
 
     # Re-create tables that migrations may have dropped
     Base.metadata.create_all(engine)
@@ -534,12 +565,15 @@ def _migrate_add_columns(engine: Engine) -> None:
         if 'num_sections' not in ci_cols:
             _add_col('num_sections', 'INTEGER DEFAULT 0')
             logger.info("Migration: added 'num_sections' to course_info.")
+        if 'section_first_day' not in ci_cols:
+            _add_col('section_first_day', "VARCHAR DEFAULT ''")
+            logger.info("Migration: added 'section_first_day' to course_info.")
+        if 'section_meeting_count' not in ci_cols:
+            _add_col('section_meeting_count', 'INTEGER DEFAULT 12')
+            logger.info("Migration: added 'section_meeting_count' to course_info.")
         if 'passing_threshold' not in ci_cols:
             _add_col('passing_threshold', 'FLOAT DEFAULT 65.0')
             logger.info("Migration: added 'passing_threshold' to course_info.")
-        if 'completion_threshold' not in ci_cols:
-            _add_col('completion_threshold', 'FLOAT DEFAULT 90.0')
-            logger.info("Migration: added 'completion_threshold' to course_info.")
         # --- classrooms (new table; no ALTER needed, create_all handles it) ---
         # --- semester_calendar ---
         existing_tables = {name for name in conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'")).scalars()}
@@ -548,6 +582,7 @@ def _migrate_add_columns(engine: Engine) -> None:
             if 'end_of_semester' not in sc_cols:
                 conn.execute(text('ALTER TABLE semester_calendar ADD COLUMN end_of_semester VARCHAR'))
                 logger.info("Migration: added 'end_of_semester' to semester_calendar.")
+
         # --- students ---
         st_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(students)"))}
         if 'section_number' not in st_cols:
@@ -575,9 +610,26 @@ def _migrate_add_columns(engine: Engine) -> None:
         if 'odt_variable_values_json' not in qz_cols:
             conn.execute(text("ALTER TABLE quizzes ADD COLUMN odt_variable_values_json TEXT DEFAULT '[]'"))
             logger.info("Migration: added 'odt_variable_values_json' to quizzes.")
+        if 'mcq_points_earned' not in qz_cols:
+            conn.execute(text("ALTER TABLE quizzes ADD COLUMN mcq_points_earned FLOAT"))
+            logger.info("Migration: added 'mcq_points_earned' to quizzes.")
+        if 'mcq_points_possible' not in qz_cols:
+            conn.execute(text("ALTER TABLE quizzes ADD COLUMN mcq_points_possible FLOAT"))
+            logger.info("Migration: added 'mcq_points_possible' to quizzes.")
+        if 'quant_points_earned' not in qz_cols:
+            conn.execute(text("ALTER TABLE quizzes ADD COLUMN quant_points_earned FLOAT"))
+            logger.info("Migration: added 'quant_points_earned' to quizzes.")
+        if 'quant_total_points' not in qz_cols:
+            conn.execute(text("ALTER TABLE quizzes ADD COLUMN quant_total_points FLOAT DEFAULT 0"))
+            logger.info("Migration: added 'quant_total_points' to quizzes.")
         if 'grading_session_id' not in qz_cols:
             conn.execute(text("ALTER TABLE quizzes ADD COLUMN grading_session_id INTEGER"))
             logger.info("Migration: added 'grading_session_id' to quizzes.")
+        # --- quiz_regrades ---
+        qr_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(quiz_regrades)"))}
+        if 'notes' not in qr_cols:
+            conn.execute(text("ALTER TABLE quiz_regrades ADD COLUMN notes TEXT"))
+            logger.info("Migration: added 'notes' to quiz_regrades.")
         conn.commit()
     # Backfill NULLs on the existing CourseInfo row
     with Session(engine) as session:
@@ -596,7 +648,6 @@ def _migrate_add_columns(engine: Engine) -> None:
             if not row.class_end_time:                row.class_end_time = '17:15';        changed = True
             if row.num_sections is None:              row.num_sections = 0;                changed = True
             if row.passing_threshold is None:         row.passing_threshold = 65.0;         changed = True
-            if row.completion_threshold is None:      row.completion_threshold = 90.0;      changed = True
             if changed:
                 session.commit()
                 logger.info("Migration: backfilled default values on existing CourseInfo row.")
@@ -666,10 +717,12 @@ def _migrate_quiz_questions(engine: Engine) -> None:
 def _migrate_student_module_progress(engine: Engine) -> None:
     """Recreate student_module_progress if it still has the old schema.
 
-    The old table had a 'status' column and no 'completed'/'attempts_count'.
-    Since the new DB has no progress data yet, we can safely drop and recreate
-    if a mismatch is detected. If the table has data, we log a warning and leave
-    it alone so a manual migration can be planned.
+    The old table had a 'status' column and no 'attempts_count'. Since the
+    new DB has no progress data yet, we can safely drop and recreate if a
+    mismatch is detected. If the table has data, we log a warning and leave
+    it alone so a manual migration can be planned. (A leftover 'completed'
+    column from an earlier schema version, if present, is harmless and left
+    in place rather than dropped.)
     """
     with engine.connect() as conn:
         existing_tables = {name for name in conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'")).scalars()}
@@ -677,7 +730,7 @@ def _migrate_student_module_progress(engine: Engine) -> None:
             return
 
         existing_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(student_module_progress)"))}
-        if 'completed' in existing_cols and 'attempts_count' in existing_cols:
+        if 'attempts_count' in existing_cols:
             return  # already up to date
 
         # Schema mismatch: check for data before dropping
@@ -692,6 +745,41 @@ def _migrate_student_module_progress(engine: Engine) -> None:
         conn.execute(text("DROP TABLE student_module_progress"))
         conn.commit()
         logger.info("Migration: dropped old student_module_progress table (empty) to recreate with new schema.")
+
+
+def _migrate_section_meeting_grades(engine: Engine) -> None:
+    """Recreate section_meeting_grades without the old 0-2 score check constraint."""
+    with engine.connect() as conn:
+        existing_tables = {
+            name for name in conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            ).scalars()
+        }
+        if 'section_meeting_grades' not in existing_tables:
+            return
+        create_sql = conn.execute(
+            text("SELECT sql FROM sqlite_master WHERE type='table' AND name='section_meeting_grades'")
+        ).scalar() or ''
+        if 'BETWEEN 0 AND 2' not in create_sql:
+            return
+
+        logger.info(
+            "Migration: recreating section_meeting_grades to remove the 0-2 score constraint."
+        )
+        conn.execute(text("DROP TABLE IF EXISTS section_meeting_grades_old"))
+        conn.execute(text("ALTER TABLE section_meeting_grades RENAME TO section_meeting_grades_old"))
+        SectionMeetingGrade.__table__.create(conn)
+        conn.execute(text(
+            "INSERT INTO section_meeting_grades "
+            "(grade_id, section_meeting_id, student_id, worksheet_id, score, attendance_status, "
+            "submission_status, grader, graded_at, note, submitted_work_path) "
+            "SELECT grade_id, section_meeting_id, student_id, worksheet_id, score, attendance_status, "
+            "submission_status, grader, graded_at, note, submitted_work_path "
+            "FROM section_meeting_grades_old"
+        ))
+        conn.execute(text("DROP TABLE section_meeting_grades_old"))
+        conn.commit()
+        logger.info("Migration: section_meeting_grades recreated without score constraint.")
 
 
 # ---------------------------------------------------------------------------
@@ -762,12 +850,13 @@ def get_course_info(engine: Engine) -> Dict:
             'first_segment_count': row.first_segment_count or 4,
             'max_attempts_per_module': row.max_attempts_per_module or 4,
             'passing_threshold': row.passing_threshold or 65.0,
-            'completion_threshold': row.completion_threshold or 90.0,
             'class_days':       row.class_days      or 'T,Th',
             'class_start_time': row.class_start_time or '15:55',
             'class_end_time':   row.class_end_time   or '17:15',
-            'class_classroom':  row.class_classroom  or '',
-            'num_sections':     row.num_sections     if row.num_sections is not None else 0,
+            'class_classroom':       row.class_classroom       or '',
+            'section_first_day':     row.section_first_day     or '',
+            'section_meeting_count': row.section_meeting_count if row.section_meeting_count is not None else 12,
+            'num_sections':          row.num_sections          if row.num_sections is not None else 0,
         }
 
 
@@ -794,12 +883,13 @@ def save_course_info(engine: Engine, data: Dict) -> None:
         row.first_segment_count     = data.get('first_segment_count',     row.first_segment_count     or 4)
         row.max_attempts_per_module = data.get('max_attempts_per_module', row.max_attempts_per_module or 4)
         row.passing_threshold    = data.get('passing_threshold',    row.passing_threshold    or 65.0)
-        row.completion_threshold = data.get('completion_threshold', row.completion_threshold or 90.0)
         row.class_days       = data.get('class_days',       row.class_days      or 'T,Th')
         row.class_start_time = data.get('class_start_time', row.class_start_time or '15:55')
         row.class_end_time   = data.get('class_end_time',   row.class_end_time   or '17:15')
-        row.class_classroom  = data.get('class_classroom',  row.class_classroom  or '')
-        row.num_sections     = data.get('num_sections',     row.num_sections     if row.num_sections is not None else 0)
+        row.class_classroom       = data.get('class_classroom',       row.class_classroom       or '')
+        row.section_first_day     = data.get('section_first_day',     row.section_first_day     or '')
+        row.section_meeting_count = data.get('section_meeting_count', row.section_meeting_count if row.section_meeting_count is not None else 12)
+        row.num_sections          = data.get('num_sections',          row.num_sections          if row.num_sections is not None else 0)
         session.commit()
 
 
@@ -827,34 +917,51 @@ def format_student_display(name: str, student_code: str) -> str:
     return f"{name} ({student_code})"
 
 
+def student_name_sort_key(name: str) -> Tuple[str, str]:
+    """Return a sort key for a student's full name based on the second name.
+
+    For names with two or more whitespace-separated parts, the sort key is
+    (second part casefolded, first part casefolded). For a single-part name,
+    the key is (single part casefolded, single part casefolded).
+    Hyphenated first names remain a single part because splitting is on
+    whitespace only.
+    """
+    parts = (name or '').strip().split()
+    if len(parts) >= 2:
+        return (parts[1].casefold(), parts[0].casefold())
+    single = (parts[0] if parts else '').casefold()
+    return (single, single)
+
+
 def get_all_students(engine: Engine, enrolled_only: bool = True) -> List[Student]:
-    """Return Student rows ordered by name."""
+    """Return Student rows ordered by second name (first surname)."""
     with Session(engine) as session:
         query = session.query(Student)
         if enrolled_only:
             query = query.filter(Student.enrolled.is_(True))
-        return query.order_by(Student.name).all()
+        rows = query.all()
+    return sorted(rows, key=lambda s: student_name_sort_key(s.name))
 
 
 def get_all_students_as_dicts(engine: Engine, enrolled_only: bool = True) -> List[Dict]:
     """Return students as plain dictionaries (safe for serialization)."""
-    with Session(engine) as session:
-        query = session.query(Student)
-        if enrolled_only:
-            query = query.filter(Student.enrolled.is_(True))
-        rows = query.order_by(Student.name).all()
-        return [_student_to_dict(r) for r in rows]
+    return [_student_to_dict(r) for r in get_all_students(engine, enrolled_only)]
 
 
 def save_enrolled_students(engine: Engine, students: List[Dict], removed_student_ids: List[int]) -> None:
-    """Save roster edits, create new students, and mark removed students as no longer enrolled."""
+    """Save roster edits, create new students, and mark removed students as no longer enrolled.
+
+    A row may also carry the student_id of a student who is currently marked
+    not enrolled; in that case the existing record is updated and re-enrolled
+    (restoring the student keeps their quiz/grading history, and is the only
+    way to reuse a removed student's code since student_code is unique).
+    """
     from student_roster26 import generate_student_code
     with Session(engine) as session:
         all_students = session.query(Student).all()
         rows_by_id = {
             row.student_id: row
             for row in all_students
-            if row.enrolled
         }
         assigned_codes = {s.student_code.casefold() for s in all_students if s.student_code}
         seen_codes = set()
@@ -867,10 +974,11 @@ def save_enrolled_students(engine: Engine, students: List[Dict], removed_student
             else:
                 row = rows_by_id.get(student_id)
                 if row is None:
-                    raise ValueError(f"Enrolled student ID {student_id!r} was not found.")
+                    raise ValueError(f"Student ID {student_id!r} was not found.")
             name = str(data.get('name') or '').strip()
             code = str(data.get('student_code') or '').strip()
             section_number = data.get('section_number')
+            email = str(data.get('email') or '').strip() or None
             if not name:
                 raise ValueError('Each enrolled student must have a name.')
             if not code:
@@ -898,6 +1006,7 @@ def save_enrolled_students(engine: Engine, students: List[Dict], removed_student
             row.name = name
             row.student_code = code
             row.section_number = section_number
+            row.email = email
             row.enrolled = True
             assigned_codes.add(folded_code)
         for student_id in removed_student_ids:
@@ -999,14 +1108,14 @@ def delete_section(engine: Engine, section_number: int) -> None:
 
 
 def get_students_in_section(engine: Engine, section_number: int) -> List[Student]:
-    """Return all students enrolled in *section_number*, ordered by name."""
+    """Return all students enrolled in *section_number*, ordered by second name."""
     with Session(engine) as session:
-        return (
+        rows = (
             session.query(Student)
             .filter_by(section_number=section_number, enrolled=True)
-            .order_by(Student.name)
             .all()
         )
+    return sorted(rows, key=lambda s: student_name_sort_key(s.name))
 
 
 def set_student_section(engine: Engine, student_code: str, section_number: Optional[int]) -> None:
@@ -1093,7 +1202,13 @@ def compute_meeting_dates(
     """
     from datetime import date, timedelta
 
-    _DAY_ABBR = {'M': 0, 'T': 1, 'W': 2, 'Th': 3, 'F': 4}
+    _DAY_ABBR = {
+        'M': 0, 'Monday': 0,
+        'T': 1, 'Tuesday': 1,
+        'W': 2, 'Wednesday': 2,
+        'Th': 3, 'Thursday': 3,
+        'F': 4, 'Friday': 4,
+    }
 
     target_dows = set()
     for d in days_of_week:
@@ -1144,14 +1259,14 @@ def _calendar_to_dict(row: 'SemesterCalendar') -> Dict:
 # ---------------------------------------------------------------------------
 
 def get_students_for_section(engine: Engine, section_number: int) -> List[Student]:
-    """Return all Student rows whose section_number matches *section_number*."""
+    """Return all Student rows whose section_number matches *section_number*, ordered by second name."""
     with Session(engine) as session:
-        return (
+        rows = (
             session.query(Student)
             .filter_by(section_number=section_number, enrolled=True)
-            .order_by(Student.name)
             .all()
         )
+    return sorted(rows, key=lambda s: student_name_sort_key(s.name))
 
 
 def get_all_classrooms(engine: Engine) -> List[Dict]:
@@ -1231,19 +1346,6 @@ def _ensure_student_module_progress(engine: Engine, student_id: int, module_numb
         return row
 
 
-def update_progress_completed(engine: Engine, student_id: int, module_number: int, completed: bool) -> None:
-    """Set the completed flag for a student/module progress row."""
-    with Session(engine) as session:
-        row = session.query(StudentModuleProgress).filter_by(
-            student_id=student_id, module_number=module_number
-        ).first()
-        if row is None:
-            row = StudentModuleProgress(student_id=student_id, module_number=module_number)
-            session.add(row)
-        row.completed = completed
-        session.commit()
-
-
 def increment_attempts_count(engine: Engine, student_id: int, module_number: int) -> None:
     """Increment the attempts_count for a student/module progress row."""
     with Session(engine) as session:
@@ -1300,20 +1402,19 @@ def add_quiz_attempt(
         return quiz
 
 
-def get_course_thresholds(engine: Engine) -> Tuple[float, float]:
-    """Return (passing_threshold, completion_threshold) from course info."""
+def get_passing_threshold(engine: Engine) -> float:
+    """Return the passing_threshold from course info."""
     info = get_course_info(engine)
-    passing = float(info.get('passing_threshold', 65.0))
-    completion = float(info.get('completion_threshold', 90.0))
-    return passing, completion
+    return float(info.get('passing_threshold', 65.0))
 
 
 def recompute_module_progress(engine: Engine, student_id: int, module_number: int) -> None:
-    """Recompute highest_score, attempts_count, completed for a student/module.
+    """Recompute highest_score and attempts_count for a student/module.
 
-    Called after any quiz score change (new attempt or regrade).
+    Called after any quiz score change (new attempt or regrade). There is no
+    "completion" state - students may take a quiz up to the configured
+    number of attempts (or more, if manually overridden).
     """
-    passing, completion = get_course_thresholds(engine)
     with Session(engine) as session:
         attempts = (
             session.query(Quiz)
@@ -1344,7 +1445,6 @@ def recompute_module_progress(engine: Engine, student_id: int, module_number: in
             session.add(row)
         row.attempts_count = len(attempts)
         row.highest_score = highest
-        row.completed = highest >= completion
         if last_attempt_dt:
             row.last_attempt = last_attempt_dt
         session.commit()
@@ -1362,6 +1462,11 @@ def record_quiz_attempt(
     date_graded: Optional[str] = None,
     date_signed_up: Optional[str] = None,
     grading_session_id: Optional[int] = None,
+    mcq_points_earned: Optional[float] = None,
+    mcq_points_possible: Optional[float] = None,
+    quant_points_earned: Optional[float] = None,
+    quant_total_points: Optional[float] = None,
+    preserve_score: bool = False,
 ) -> Quiz:
     """Record a quiz attempt and update module progress in one step.
 
@@ -1386,7 +1491,7 @@ def record_quiz_attempt(
         time_taken = datetime.now().strftime('%H:%M:%S')
 
     with Session(engine) as session:
-        passing, _ = get_course_thresholds(engine)
+        passing = get_passing_threshold(engine)
         is_passing = 1 if (score is not None and float(score) >= passing) else 0
 
         quiz = session.query(Quiz).filter_by(
@@ -1395,18 +1500,36 @@ def record_quiz_attempt(
         if quiz is None:
             quiz = Quiz(student_id=student_id, module_number=module_number, quiz_id=quiz_id)
             session.add(quiz)
-        elif quiz.score is not None and score is not None and quiz.score != score:
+        elif not preserve_score and quiz.score is not None and score is not None and quiz.score != score:
             quiz.score_corrected = 1
             quiz.date_score_corrected = datetime.now().strftime('%Y-%m-%d')
 
         quiz.date_taken = date_taken
         quiz.time_taken = time_taken
-        quiz.date_graded = date_graded
+        if not preserve_score:
+            quiz.date_graded = date_graded
         quiz.date_signed_up = date_signed_up if date_signed_up is not None else quiz.date_signed_up
-        quiz.grading_session_id = grading_session_id
-        quiz.score = score
+        if grading_session_id is not None:
+            # Verify the grading session still exists to avoid FK violations
+            # (sessions may have been cleared during TEST_MODE).
+            gs = session.query(GradingSession).filter_by(
+                grading_session_id=grading_session_id,
+            ).first()
+            if gs is not None:
+                quiz.grading_session_id = grading_session_id
+        if not preserve_score:
+            quiz.score = score
+            quiz.is_passing = is_passing
         quiz.total_questions = total_questions
-        quiz.is_passing = is_passing
+        if mcq_points_earned is not None:
+            quiz.mcq_points_earned = float(mcq_points_earned)
+        if mcq_points_possible is not None:
+            quiz.mcq_points_possible = float(mcq_points_possible)
+        quiz.quant_points_earned = (
+            float(quant_points_earned) if quant_points_earned is not None else None
+        )
+        if quant_total_points is not None:
+            quiz.quant_total_points = float(quant_total_points)
         session.commit()
         session.refresh(quiz)
 
@@ -1414,11 +1537,38 @@ def record_quiz_attempt(
     return quiz
 
 
-def get_quiz_score_by_quiz_id(engine: Engine, quiz_id: str) -> Optional[int]:
-    """Return the currently recorded score for *quiz_id*, or None if it
-    hasn't been graded yet (or doesn't exist)."""
+def get_pending_quant_quizzes(engine: Engine) -> List[Dict]:
     with Session(engine) as session:
-        row = session.query(Quiz).filter_by(quiz_id=quiz_id).first()
+        rows = (
+            session.query(Quiz)
+            .options(joinedload(Quiz.student))
+            .filter(
+                Quiz.has_odt.is_(True),
+                Quiz.mcq_points_earned.isnot(None),
+                Quiz.mcq_points_possible.isnot(None),
+                Quiz.quant_points_earned.is_(None),
+            )
+            .order_by(Quiz.date_taken, Quiz.quiz_id)
+            .all()
+        )
+        return [_quiz_to_dict(row) for row in rows]
+
+
+def get_quiz_score_by_quiz_id(
+    engine: Engine, quiz_id: str, student_id: Optional[int] = None,
+) -> Optional[int]:
+    """Return the currently recorded score for *quiz_id*, or None if it
+    hasn't been graded yet (or doesn't exist).
+
+    If *student_id* is given the lookup is scoped to that student,
+    which avoids returning a score from a different student when the
+    same physical quiz has been transferred.
+    """
+    with Session(engine) as session:
+        query = session.query(Quiz).filter_by(quiz_id=quiz_id)
+        if student_id is not None:
+            query = query.filter_by(student_id=student_id)
+        row = query.first()
         return row.score if row else None
 
 
@@ -1432,12 +1582,18 @@ def _quiz_to_dict(quiz: Quiz) -> Dict:
         'quiz_id': quiz.quiz_id,
         'date_taken': quiz.date_taken or '',
         'time_taken': quiz.time_taken or '',
+        'date_graded': quiz.date_graded,
         'total_questions': quiz.total_questions,
         'score': quiz.score,
         'has_odt': bool(quiz.has_odt),
         'odt_template_path': quiz.odt_template_path or '',
         'odt_variable_names_json': quiz.odt_variable_names_json or '[]',
         'odt_variable_values_json': quiz.odt_variable_values_json or '{}',
+        'mcq_points_earned': quiz.mcq_points_earned,
+        'mcq_points_possible': quiz.mcq_points_possible,
+        'quant_points_earned': quiz.quant_points_earned,
+        'quant_total_points': float(quiz.quant_total_points or 0),
+        'grading_session_id': quiz.grading_session_id,
         'student': _student_to_dict(student) if student else None,
     }
 
@@ -1447,6 +1603,72 @@ def get_quiz_by_id(engine: Engine, quiz_id: str) -> Optional[Dict]:
     with Session(engine) as session:
         quiz = session.query(Quiz).filter_by(quiz_id=quiz_id).first()
         return _quiz_to_dict(quiz) if quiz else None
+
+
+def record_quiz_regrade(
+    engine: Engine, quiz_id: int, previous_score: Optional[int], new_score: int,
+    student_answers: Dict[int, List[str]],
+    notes: Optional[str] = None,
+) -> int:
+    with Session(engine) as session:
+        row = QuizRegrade(
+            quiz_id=quiz_id,
+            previous_score=previous_score,
+            new_score=new_score,
+            student_answers_json=json.dumps(student_answers),
+            notes=notes,
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return row.regrade_id
+
+
+def revise_quiz_score(
+    engine: Engine, quiz_id: int, new_score: int, note: str = '',
+    include_quant: bool = True,
+) -> Optional[Quiz]:
+    """Override a quiz attempt's total score directly (e.g. disqualification).
+
+    Unlike regrading, which derives the score from corrected answers, this
+    writes the given 0-100 value as the attempt's score - used for
+    disqualifications or other instructor overrides where the recorded
+    answers are not the point.
+
+    The *note* (the reason for the override) is timestamped and appended to
+    the quiz's `comment` field, which is the per-attempt home for grader
+    remarks. When *include_quant* is set and the quiz has a quant section,
+    `quant_points_earned` is scaled to match the override (e.g. 0 for a full
+    disqualification); otherwise the recorded quant work is left as-is.
+    `mcq_points_earned` is always left alone as detection evidence - the
+    override lives in `score`.  Student progress is recomputed so highest
+    score / passing status reflect the revision.
+
+    Returns the updated Quiz row or None if not found.
+    """
+    today = datetime.now().strftime('%Y-%m-%d')
+    with Session(engine) as session:
+        quiz = session.query(Quiz).filter_by(id=quiz_id).first()
+        if quiz is None:
+            return None
+        passing = get_passing_threshold(engine)
+        if quiz.score is not None and quiz.score != new_score:
+            quiz.score_corrected = 1
+            quiz.date_score_corrected = today
+        quiz.score = new_score
+        quiz.is_passing = 1 if float(new_score) >= passing else 0
+        quiz.date_graded = today
+        if note:
+            stamped = f'[{today}] {note}'
+            quiz.comment = f'{quiz.comment}\n{stamped}' if quiz.comment else stamped
+        if include_quant and quiz.has_odt:
+            quiz.quant_points_earned = float(quiz.quant_total_points or 0) * new_score / 100.0
+        session.commit()
+        student_id = quiz.student_id
+        module_number = quiz.module_number
+
+    recompute_module_progress(engine, student_id, module_number)
+    return quiz
 
 
 def update_quiz_score(engine: Engine, quiz_id: int, new_score: Optional[int]) -> Optional[Quiz]:
@@ -1460,7 +1682,7 @@ def update_quiz_score(engine: Engine, quiz_id: int, new_score: Optional[int]) ->
         quiz = session.query(Quiz).filter_by(id=quiz_id).first()
         if quiz is None:
             return None
-        passing, _ = get_course_thresholds(engine)
+        passing = get_passing_threshold(engine)
         if quiz.score is not None and new_score is not None and quiz.score != new_score:
             quiz.score_corrected = 1
             quiz.date_score_corrected = datetime.now().strftime('%Y-%m-%d')
@@ -1475,6 +1697,32 @@ def update_quiz_score(engine: Engine, quiz_id: int, new_score: Optional[int]) ->
     return quiz
 
 
+def reassign_quiz_attempt(engine: Engine, quiz_id: int, new_student_id: int) -> Optional[Quiz]:
+    """Transfer a Quiz row (and its QuizQuestion rows) to a different student.
+
+    Used when a scan resolves to a spare quiz (TA, departed student, or
+    "Sample Questions") that was actually taken by someone else. Reassigning
+    in place preserves has_odt, odt_template_path, quant totals, and
+    grading-artifact linkage that delete + re-record would lose. Module
+    progress is recomputed for both students.
+    """
+    with Session(engine) as session:
+        quiz = session.query(Quiz).filter_by(id=quiz_id).first()
+        if quiz is None:
+            return None
+        old_student_id = quiz.student_id
+        module_number = quiz.module_number
+        quiz_id_str = quiz.quiz_id
+        quiz.student_id = new_student_id
+        session.query(QuizQuestion).filter_by(quiz_id=quiz_id_str).update(
+            {'student_id': new_student_id})
+        session.commit()
+        session.refresh(quiz)
+    recompute_module_progress(engine, old_student_id, module_number)
+    recompute_module_progress(engine, new_student_id, module_number)
+    return quiz
+
+
 def delete_quiz_attempt(engine: Engine, quiz_id: int) -> None:
     """Delete a Quiz row by its primary key and recompute module progress."""
     with Session(engine) as session:
@@ -1485,6 +1733,23 @@ def delete_quiz_attempt(engine: Engine, quiz_id: int) -> None:
             session.delete(row)
             session.commit()
             recompute_module_progress(engine, student_id, module_number)
+
+
+def reset_module_attempts(engine: Engine, student_id: int, module_number: int) -> None:
+    """Reset attempts_count and highest_score to 0 for a student/module.
+
+    This is intended for testing / cleanup and leaves the underlying Quiz
+    rows untouched. Use delete_quiz_attempt() to remove individual attempts.
+    """
+    with Session(engine) as session:
+        row = session.query(StudentModuleProgress).filter_by(
+            student_id=student_id, module_number=module_number
+        ).first()
+        if row:
+            row.attempts_count = 0
+            row.highest_score = 0.0
+            row.last_attempt = None
+            session.commit()
 
 
 def update_quiz_question_correct_index(
@@ -1513,6 +1778,19 @@ def quiz_attempt_exists(engine: Engine, student_id: int, module_number: int, qui
             module_number=module_number,
             quiz_id=quiz_id,
         ).first() is not None
+
+
+def quiz_id_exists(engine: Engine, quiz_id: str) -> bool:
+    """Return True if the quiz_id exists under ANY student.
+
+    Quizzes may be transferred between students during grading, so a quiz_id
+    printed for one student can be owned by another.  quiz_id values must
+    never be reused: the printed artifacts, the quiz_questions uniqueness
+    constraint on (quiz_id, question_number), and scan-time identification
+    all assume one physical quiz per id.
+    """
+    with Session(engine) as session:
+        return session.query(Quiz.id).filter_by(quiz_id=quiz_id).first() is not None
 
 
 def get_student_module_question_ids(engine: Engine, student_id: int, module_number: int) -> set[str]:
@@ -1545,6 +1823,7 @@ def update_quiz_odt_info(
     odt_template_path: Optional[str] = None,
     odt_variable_names: Optional[List[str]] = None,
     odt_variable_values: Optional[Dict[str, Any]] = None,
+    quant_total_points: Optional[float] = None,
 ) -> Optional[Quiz]:
     """Update ODT template, variable names and values for a quiz."""
     with Session(engine) as session:
@@ -1557,6 +1836,8 @@ def update_quiz_odt_info(
             quiz.odt_variable_names_json = json.dumps(odt_variable_names)
         if odt_variable_values is not None:
             quiz.odt_variable_values_json = json.dumps(odt_variable_values)
+        if quant_total_points is not None:
+            quiz.quant_total_points = float(quant_total_points)
         session.commit()
         session.refresh(quiz)
     return quiz
@@ -1591,12 +1872,19 @@ def add_generated_quiz_attempt(
     odt_template_path: Optional[str] = None,
     odt_variable_names: Optional[List[str]] = None,
     odt_variable_values: Optional[Dict[str, Any]] = None,
+    quant_total_points: float = 0.0,
 ) -> Quiz:
     with Session(engine) as session:
         existing = (session.query(Quiz)
-                    .filter_by(student_id=student_id, module_number=module_number, quiz_id=quiz_id)
+                    .filter_by(quiz_id=quiz_id)
                     .first())
         if existing is not None:
+            if existing.student_id != student_id:
+                raise ValueError(
+                    f'Quiz {quiz_id} already exists under another student '
+                    f'(student_id {existing.student_id}); refusing to overwrite '
+                    f'a possibly transferred quiz'
+                )
             question_count = session.query(QuizQuestion).filter_by(quiz_id=quiz_id).count()
             if question_count:
                 return existing
@@ -1613,6 +1901,7 @@ def add_generated_quiz_attempt(
             odt_template_path=odt_template_path or '',
             odt_variable_names_json=json.dumps(odt_variable_names or []),
             odt_variable_values_json=json.dumps(odt_variable_values or {}),
+            quant_total_points=float(quant_total_points or 0),
         )
         session.add(quiz)
         session.flush()
@@ -1668,8 +1957,6 @@ def save_section_meeting(engine: Engine, data: Dict) -> int:
 def save_section_meeting_grade(engine: Engine, data: Dict) -> int:
     score_supplied = 'score' in data
     score = data.get('score')
-    if score_supplied and score is not None and score not in (0, 1, 2):
-        raise ValueError('Section meeting score must be 0, 1, 2, or None')
     with Session(engine) as session:
         row = (session.query(SectionMeetingGrade)
                .filter_by(section_meeting_id=data['section_meeting_id'], student_id=data['student_id'])
@@ -1713,6 +2000,158 @@ def get_section_meeting_grades(engine: Engine, section_meeting_id: int) -> List[
             'note': row.note or '',
             'submitted_work_path': row.submitted_work_path or '',
         } for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Lecture / section participation helpers
+# ---------------------------------------------------------------------------
+
+def get_lecture_meetings(engine: Engine) -> List[Dict]:
+    """Return all LectureMeeting rows ordered by date, start_time."""
+    with Session(engine) as session:
+        rows = session.query(LectureMeeting).order_by(
+            LectureMeeting.meeting_date, LectureMeeting.start_time
+        ).all()
+        return [_lecture_meeting_to_dict(r) for r in rows]
+
+
+def save_lecture_meeting(engine: Engine, data: Dict) -> int:
+    """Upsert a LectureMeeting. Returns the meeting_id."""
+    with Session(engine) as session:
+        meeting_id = data.get('meeting_id')
+        row = session.query(LectureMeeting).filter_by(meeting_id=meeting_id).first() if meeting_id else None
+        if row is None:
+            sequence = data.get('meeting_sequence')
+            if sequence is None:
+                sequence = (session.query(func.max(LectureMeeting.meeting_sequence)).scalar() or 0) + 1
+            row = LectureMeeting(meeting_sequence=sequence)
+            session.add(row)
+        row.meeting_date = data['meeting_date']
+        row.start_time = data.get('start_time', row.start_time)
+        row.end_time = data.get('end_time', row.end_time)
+        row.title = data.get('title', row.title)
+        session.commit()
+        session.refresh(row)
+        return row.meeting_id
+
+
+def generate_lecture_meetings(engine: Engine) -> int:
+    """Generate lecture meetings from course_info.class_days and the semester calendar.
+
+    Returns the number of newly created meetings.
+    """
+    info = get_course_info(engine)
+    year = info.get('year', 2026)
+    semester = info.get('semester', 'F')
+    cal = get_semester_calendar(engine, year, semester)
+    if not cal or not cal.get('first_day') or not cal.get('last_day'):
+        raise ValueError("Semester calendar first_day and last_day are required.")
+    days_str = info.get('class_days', '') or ''
+    days_of_week = [d.strip() for d in days_str.split(',') if d.strip()]
+    if not days_of_week:
+        raise ValueError("No class_days configured in course info.")
+    start_time = info.get('class_start_time', '') or ''
+    end_time = info.get('class_end_time', '') or ''
+
+    dates = compute_meeting_dates(
+        first_day=cal['first_day'],
+        last_day=cal['last_day'],
+        days_of_week=days_of_week,
+        no_class_days=cal.get('no_class_days', []),
+        brandeis_days=cal.get('brandeis_days', []),
+    )
+
+    existing = {
+        (m['meeting_date'], m['start_time']): m
+        for m in get_lecture_meetings(engine)
+    }
+    next_sequence = max([m['meeting_sequence'] for m in existing.values()] + [0]) + 1
+    created = 0
+    for date in dates:
+        if (date, start_time) in existing:
+            continue
+        save_lecture_meeting(
+            engine,
+            {
+                'meeting_date': date,
+                'start_time': start_time,
+                'end_time': end_time,
+                'meeting_sequence': next_sequence,
+            },
+        )
+        next_sequence += 1
+        created += 1
+    return created
+
+
+def get_lecture_participation(engine: Engine, lecture_meeting_id: int) -> List[Dict]:
+    """Return all LectureParticipation rows for a lecture meeting."""
+    with Session(engine) as session:
+        rows = session.query(LectureParticipation).filter_by(
+            lecture_meeting_id=lecture_meeting_id
+        ).order_by(LectureParticipation.student_id).all()
+        return [_lecture_participation_to_dict(r) for r in rows]
+
+
+def save_lecture_participation(engine: Engine, data: Dict) -> int:
+    """Upsert a LectureParticipation row. Returns the participation_id."""
+    with Session(engine) as session:
+        row = (
+            session.query(LectureParticipation)
+            .filter_by(
+                lecture_meeting_id=data['lecture_meeting_id'],
+                student_id=data['student_id'],
+            )
+            .first()
+        )
+        if row is None:
+            row = LectureParticipation(
+                lecture_meeting_id=data['lecture_meeting_id'],
+                student_id=data['student_id'],
+            )
+            session.add(row)
+        if 'score' in data:
+            row.score = data.get('score')
+        if 'note' in data:
+            row.note = data.get('note')
+        session.commit()
+        session.refresh(row)
+        return row.participation_id
+
+
+def get_section_participation(engine: Engine, section_meeting_id: int) -> List[Dict]:
+    """Return participation-grade records for a section meeting."""
+    return get_section_meeting_grades(engine, section_meeting_id)
+
+
+def save_section_participation(engine: Engine, data: Dict) -> int:
+    """Save a participation score for a section meeting and student."""
+    return save_section_meeting_grade(engine, {
+        'section_meeting_id': data['section_meeting_id'],
+        'student_id': data['student_id'],
+        'score': data.get('score'),
+    })
+
+
+def _lecture_meeting_to_dict(row: LectureMeeting) -> Dict:
+    return {
+        'meeting_id': row.meeting_id,
+        'meeting_date': row.meeting_date,
+        'start_time': row.start_time or '',
+        'end_time': row.end_time or '',
+        'meeting_sequence': row.meeting_sequence,
+        'title': row.title or '',
+    }
+
+
+def _lecture_participation_to_dict(row: LectureParticipation) -> Dict:
+    return {
+        'participation_id': row.participation_id,
+        'lecture_meeting_id': row.lecture_meeting_id,
+        'student_id': row.student_id,
+        'score': row.score,
+        'note': row.note or '',
+    }
 
 
 def _section_meeting_to_dict(row: SectionMeeting) -> Dict:
@@ -1791,25 +2230,6 @@ def delete_quiz_session(engine: Engine, session_id: int) -> None:
             session.commit()
 
 
-def get_active_session_signups(engine: Engine, session_id: int) -> List[Dict]:
-    with Session(engine) as session:
-        rows = (
-            session.query(SessionSignup, Student)
-            .join(Student, Student.student_id == SessionSignup.student_id)
-            .filter(SessionSignup.session_id == session_id)
-            .order_by(Student.name)
-            .all()
-        )
-        return [{
-            'signup_id': signup.signup_id,
-            'student_id': student.student_id,
-            'student_code': student.student_code,
-            'student_name': student.name,
-            'module_number': signup.module_number,
-            'quiz_id': signup.quiz_id,
-        } for signup, student in rows]
-
-
 def get_upcoming_quiz_sessions(engine: Engine, from_date: str | None = None) -> List[Dict]:
     """Return active QuizSession rows on or after *from_date* (defaults to today)."""
     if from_date is None:
@@ -1823,12 +2243,6 @@ def get_upcoming_quiz_sessions(engine: Engine, from_date: str | None = None) -> 
             .all()
         )
         return [_session_to_dict(r) for r in rows]
-
-
-def get_session_signup_count(engine: Engine, session_id: int) -> int:
-    """Return the number of active signups for a quiz session."""
-    with Session(engine) as session:
-        return session.query(SessionSignup).filter_by(session_id=session_id).count()
 
 
 def find_student_by_email_or_name(engine: Engine, email: str, name: str) -> Optional[Dict]:
@@ -1864,34 +2278,6 @@ def find_student_by_email_or_name(engine: Engine, email: str, name: str) -> Opti
                     'email': row.email or '',
                 }
         return None
-
-
-def create_session_signups(
-    engine: Engine,
-    session_id: int,
-    student_ids: List[int],
-    module_number: int,
-    quiz_ids: Dict[int, str],
-) -> int:
-    with Session(engine) as session:
-        created = 0
-        for student_id in student_ids:
-            quiz_id = quiz_ids.get(student_id)
-            if not quiz_id:
-                continue
-            exists = session.query(SessionSignup).filter_by(
-                session_id=session_id, student_id=student_id, quiz_id=quiz_id,
-            ).first()
-            if exists is None:
-                session.add(SessionSignup(
-                    session_id=session_id,
-                    student_id=student_id,
-                    module_number=module_number,
-                    quiz_id=quiz_id,
-                ))
-                created += 1
-        session.commit()
-        return created
 
 
 def queue_outgoing_email(
@@ -1931,6 +2317,16 @@ def get_outgoing_emails(engine: Engine, status: Optional[str] = None) -> List[Di
         } for row in query.all()]
 
 
+def delete_outgoing_email(engine: Engine, email_id: int) -> bool:
+    with Session(engine) as session:
+        row = session.query(OutgoingEmail).filter_by(email_id=email_id).first()
+        if row is None:
+            return False
+        session.delete(row)
+        session.commit()
+        return True
+
+
 def update_outgoing_email_status(
     engine: Engine,
     email_id: int,
@@ -1945,6 +2341,31 @@ def update_outgoing_email_status(
         row.error = error
         row.sent_at = datetime.now() if status == 'sent' else None
         session.commit()
+
+
+def update_outgoing_email(
+    engine: Engine,
+    email_id: int,
+    recipient: Optional[str] = None,
+    subject: Optional[str] = None,
+    body: Optional[str] = None,
+) -> bool:
+    """Edit the recipient/subject/body of a queued email.
+
+    Returns False if the email does not exist or is no longer queued.
+    """
+    with Session(engine) as session:
+        row = session.query(OutgoingEmail).filter_by(email_id=email_id).first()
+        if row is None or row.status != 'queued':
+            return False
+        if recipient is not None:
+            row.recipient = recipient
+        if subject is not None:
+            row.subject = subject
+        if body is not None:
+            row.body = body
+        session.commit()
+        return True
 
 
 def _session_to_dict(row: 'QuizSession') -> Dict:
@@ -2046,6 +2467,13 @@ def get_grading_session(engine: Engine, grading_session_id: int) -> Optional[Dic
     with Session(engine) as session:
         row = session.query(GradingSession).filter_by(grading_session_id=grading_session_id).first()
         return _grading_session_to_dict(row) if row else None
+
+
+def clear_grading_sessions(engine: Engine) -> int:
+    with Session(engine) as session:
+        count = session.query(GradingSession).delete(synchronize_session=False)
+        session.commit()
+        return count
 
 
 def _grading_session_to_dict(row: 'GradingSession') -> Dict:

@@ -3,7 +3,8 @@
 This module uses Playwright with a persistent Chrome profile so the user can
 log in to Moodle/SSO/Duo once and reuse the session across syncs. It publishes
 active MCQ26 quiz sessions as options in the "Quiz Session Signup" Choice
-activity and imports student responses back into the MCQ26 database.
+activity. Student quiz assignments are determined from scanned QR codes at
+grading time, so responses are no longer imported back into the MCQ26 database.
 """
 
 from __future__ import annotations
@@ -12,20 +13,16 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Dict, List, Optional
 from urllib.parse import urljoin
 
 from playwright.sync_api import Page, sync_playwright
 
 from database26 import (
     Engine,
-    Session,
-    SessionSignup,
-    find_student_by_email_or_name,
     get_all_classrooms,
     get_upcoming_quiz_sessions,
 )
-from qsession_signup26 import assign_students_to_qsession
 
 
 DEFAULT_CHOICE_NAME = "Quiz Session Signup"
@@ -317,102 +314,34 @@ class MoodleChoiceSync:
     def sync(
         self,
         engine: Engine,
-        module_number: int,
-        course_folder: str,
         from_date: Optional[str] = None,
         days_ahead: Optional[int] = None,
     ) -> SyncResult:
-        """Publish sessions to Moodle and import student responses.
+        """Publish sessions to Moodle.
+
+        Student quiz assignments are determined from scanned QR codes at grading
+        time, so responses are no longer imported back into the MCQ26 database.
 
         Args:
             engine: SQLAlchemy engine.
-            module_number: Module number to assign to imported signups.
-            course_folder: Course folder path used to locate available quizzes.
             from_date: Optional YYYY-MM-DD start date; defaults to today.
             days_ahead: Optional number of days into the future to publish.
         """
         options = self.build_session_options(engine, from_date, days_ahead)
-        label_to_option = {opt.label: opt for opt in options}
 
         cmid = self.find_choice_cmid()
         self.set_choice_options(cmid, options)
 
-        responses = self.read_responses(cmid)
-        result = SyncResult(
+        return SyncResult(
             published_options=len(options),
             imported_signups=0,
             unmatched_users=[],
             errors=[],
         )
 
-        session_students: Dict[int, List[int]] = {}
-        for response in responses:
-            option = label_to_option.get(response.option_label)
-            if option is None:
-                result.errors.append(
-                    f"Response '{response.option_label}' from {response.user_name} "
-                    "does not match any current session option."
-                )
-                continue
-
-            student = find_student_by_email_or_name(
-                engine, response.user_email, response.user_name
-            )
-            if student is None:
-                result.unmatched_users.append(
-                    f"{response.user_name} <{response.user_email}>"
-                )
-                continue
-
-            session_students.setdefault(option.session_id, []).append(student["student_id"])
-
-        # Import signups per session, deduplicating against the database.
-        for session_id, student_ids in session_students.items():
-            unique_ids = self._filter_new_signups(engine, session_id, student_ids)
-            if not unique_ids:
-                continue
-            try:
-                assignment = assign_students_to_qsession(
-                    engine,
-                    session_id,
-                    unique_ids,
-                    module_number,
-                    course_folder,
-                )
-                result.imported_signups += assignment['created']
-                if assignment['missing_student_ids']:
-                    result.errors.append(
-                        f"Session {session_id}: "
-                        f"{len(assignment['missing_student_ids'])} student(s) had no available quiz PDF."
-                    )
-            except Exception as exc:
-                result.errors.append(
-                    f"Failed to assign students to session {session_id}: {exc}"
-                )
-
-        return result
-
-    @staticmethod
-    def _filter_new_signups(
-        engine: Engine, session_id: int, student_ids: Iterable[int]
-    ) -> List[int]:
-        """Return student_ids that do not already have a signup for the session."""
-        existing: Set[int] = set()
-        with Session(engine) as session:
-            rows = (
-                session.query(SessionSignup.student_id)
-                .filter(SessionSignup.session_id == session_id)
-                .distinct()
-                .all()
-            )
-            existing = {row[0] for row in rows}
-        return [sid for sid in student_ids if sid not in existing]
-
 
 def sync_moodle_choice(
     engine: Engine,
-    module_number: int,
-    course_folder: str,
     course_url: str,
     choice_name: str = DEFAULT_CHOICE_NAME,
     headless: bool = False,
@@ -420,7 +349,7 @@ def sync_moodle_choice(
     from_date: Optional[str] = None,
     days_ahead: Optional[int] = None,
 ) -> SyncResult:
-    """Convenience entry point: open the browser, sync, and close it."""
+    """Convenience entry point: open the browser, publish sessions, and close it."""
     with MoodleChoiceSync(
         course_url=course_url,
         choice_name=choice_name,
@@ -429,8 +358,6 @@ def sync_moodle_choice(
     ) as sync:
         return sync.sync(
             engine=engine,
-            module_number=module_number,
-            course_folder=course_folder,
             from_date=from_date,
             days_ahead=days_ahead,
         )

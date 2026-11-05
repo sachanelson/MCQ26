@@ -1,6 +1,7 @@
 import math
 import re
 from pathlib import Path
+from typing import Any, Dict, List
 
 import pandas as pd
 from sqlalchemy.orm import Session
@@ -62,18 +63,188 @@ def generate_student_code(name: str, existing_codes: set[str]) -> str:
     return f'{base}{suffix}'
 
 
-def import_section_roster(file_path: str, engine, section_number: int) -> int:
-    """Import an enrollment Excel report and assign every imported student to a section."""
+def _parse_roster_rows(file_path: str) -> List[Dict[str, Any]]:
+    """Return a list of {source_row, name, email} dicts from an enrollment Excel file."""
     path = Path(file_path).expanduser()
-    if path.suffix.lower() not in {'.xlsx', '.xls'}:
-        raise ValueError('Roster imports must be Excel files (.xlsx or .xls).')
+    report = pd.read_excel(path, header=None)
+    rows = []
+    for idx, row in report.iterrows():
+        name = parse_enrollment_name(
+            row.iloc[0] if len(row) > 0 else None,
+            row.iloc[2] if len(row) > 2 else None,
+        )
+        email = _text(row.iloc[4] if len(row) > 4 else None)
+        if not name or not email or '@' not in email:
+            continue
+        rows.append({
+            'source_row': int(idx),
+            'name': name,
+            'email': email,
+        })
+    return rows
+
+
+def _analyze_roster_rows(
+    rows: List[Dict[str, Any]],
+    session,
+    section_number: int,
+) -> Dict[str, Any]:
+    """Analyze parsed roster rows against the current database session.
+
+    Returns a dict with:
+        rows: the input rows annotated with 'action' and 'reason' keys
+        conflicts: human-readable conflict messages
+        duplicates: rows that share a name/email with another import row and
+                    would otherwise be added as a new student
+        updates: rows that will update an existing student
+        additions: rows that will create a new student
+    """
+    conflicts: List[str] = []
+    duplicate_rows: List[Dict[str, Any]] = []
+    update_rows: List[Dict[str, Any]] = []
+    add_rows: List[Dict[str, Any]] = []
+
+    seen_names: Dict[str, Dict[str, Any]] = {}
+    seen_emails: Dict[str, Dict[str, Any]] = {}
+
+    students_by_email = {
+        student.email.casefold(): student
+        for student in session.query(Student).all()
+        if student.email
+    }
+    students_by_name = {
+        student.name.casefold(): student
+        for student in session.query(Student).all()
+        if student.name
+    }
+
+    for row in rows:
+        name_lower = row['name'].casefold()
+        email_lower = row['email'].casefold()
+        by_email = students_by_email.get(email_lower)
+        by_name = students_by_name.get(name_lower)
+        row['duplicate_reasons'] = []
+
+        if by_email is not None and by_email is by_name:
+            row['action'] = 'update'
+            row['student'] = by_email
+            row['reason'] = (
+                f"Will update existing student {by_email.name} "
+                f"({by_email.student_code or '?'}) and assign to section {section_number}."
+            )
+            update_rows.append(row)
+        elif by_email is not None and by_name is None:
+            e_info = (
+                f"email={by_email.name}/{by_email.student_code or '?'}/"
+                f"sec{by_email.section_number}"
+            )
+            row['action'] = 'conflict'
+            row['reason'] = (
+                f"Row {row['source_row']}: '{row['name']}' / '{row['email']}' "
+                f"matched by name=no name match and {e_info} but not to the same student"
+            )
+            conflicts.append(row['reason'])
+        elif by_email is None and by_name is not None:
+            n_info = (
+                f"name={by_name.name}/{by_name.student_code or '?'}/"
+                f"sec{by_name.section_number}"
+            )
+            row['action'] = 'conflict'
+            row['reason'] = (
+                f"Row {row['source_row']}: '{row['name']}' / '{row['email']}' "
+                f"matched by {n_info} and email=no email match but not to the same student"
+            )
+            conflicts.append(row['reason'])
+        elif by_email is not None and by_name is not None and by_email is not by_name:
+            n_info = (
+                f"name={by_name.name}/{by_name.student_code or '?'}/"
+                f"sec{by_name.section_number}"
+            )
+            e_info = (
+                f"email={by_email.name}/{by_email.student_code or '?'}/"
+                f"sec{by_email.section_number}"
+            )
+            row['action'] = 'conflict'
+            row['reason'] = (
+                f"Row {row['source_row']}: '{row['name']}' / '{row['email']}' "
+                f"matched by {n_info} and {e_info} but not to the same student"
+            )
+            conflicts.append(row['reason'])
+        else:
+            row['action'] = 'add'
+            row['student'] = None
+            row['reason'] = None
+            add_rows.append(row)
+
+        # Detect duplicate names/emails within the import file.
+        if name_lower in seen_names and seen_names[name_lower] is not row:
+            row['duplicate_reasons'].append(
+                f"name '{row['name']}' also appears on row {seen_names[name_lower]['source_row']}"
+            )
+        if email_lower in seen_emails and seen_emails[email_lower] is not row:
+            row['duplicate_reasons'].append(
+                f"email '{row['email']}' also appears on row {seen_emails[email_lower]['source_row']}"
+            )
+
+        if row['action'] == 'add' and row['duplicate_reasons']:
+            duplicate_rows.append(row)
+
+        seen_names.setdefault(name_lower, row)
+        seen_emails.setdefault(email_lower, row)
+
+    return {
+        'rows': rows,
+        'conflicts': conflicts,
+        'duplicates': duplicate_rows,
+        'updates': update_rows,
+        'additions': add_rows,
+    }
+
+
+def preview_section_roster(
+    file_path_or_rows,
+    engine,
+    section_number: int,
+) -> Dict[str, Any]:
+    """Preview a roster import without writing to the database.
+
+    Accepts either a path to an Excel file or an already-parsed list of row
+    dicts with 'source_row', 'name', and 'email' keys.
+    """
+    if isinstance(file_path_or_rows, str):
+        path = Path(file_path_or_rows).expanduser()
+        if path.suffix.lower() not in {'.xlsx', '.xls'}:
+            raise ValueError('Roster imports must be Excel files (.xlsx or .xls).')
+        parsed_rows = _parse_roster_rows(file_path_or_rows)
+    else:
+        parsed_rows = list(file_path_or_rows)
+
     if get_section(engine, section_number) is None:
         raise ValueError(f'Section {section_number} must be defined in Course Info before importing its roster.')
 
-    report = pd.read_excel(path, header=None)
-    imported = 0
-    imported_names: set = set()
     with Session(engine) as session:
+        return _analyze_roster_rows(parsed_rows, session, section_number)
+
+
+def import_section_roster(
+    rows: List[Dict[str, Any]],
+    engine,
+    section_number: int,
+) -> Dict[str, Any]:
+    """Apply a roster import from already-parsed and reviewed row dicts.
+
+    The caller is expected to have first used preview_section_roster, optionally
+    edited or removed duplicate rows with user confirmation, and then passed
+    the resulting row list here. The list is re-analyzed against the current
+    database state before any writes occur.
+
+    Returns a dict with 'imported' count and 'conflicts' list.
+    """
+    imported = 0
+    imported_names: set[str] = set()
+
+    with Session(engine) as session:
+        analysis = _analyze_roster_rows(rows, session, section_number)
         existing_codes = {
             student.student_code.casefold()
             for student in session.query(Student).all()
@@ -89,21 +260,19 @@ def import_section_roster(file_path: str, engine, section_number: int) -> int:
             for student in session.query(Student).all()
             if student.name
         }
-        conflicts = []
-        for idx, row in report.iterrows():
-            name = parse_enrollment_name(row.iloc[0] if len(row) > 0 else None,
-                                         row.iloc[2] if len(row) > 2 else None)
-            email = _text(row.iloc[4] if len(row) > 4 else None)
-            if not name or not email or '@' not in email:
+
+        for row in analysis['rows']:
+            if row['action'] == 'conflict':
                 continue
-            imported_names.add(name.casefold())
+
+            name = row['name']
+            email = row['email']
             name_lower = name.casefold()
             email_lower = email.casefold()
-            by_email = students_by_email.get(email_lower)
-            by_name = students_by_name.get(name_lower)
-            if by_email is not None and by_email is by_name:
-                # Exact match by both name and email to the same student.
-                student = by_email
+            imported_names.add(name_lower)
+
+            if row['action'] == 'update':
+                student = students_by_email.get(email_lower) or students_by_name.get(name_lower)
                 name_changed = student.name != name
                 student.name = name
                 student.email = email
@@ -116,11 +285,7 @@ def import_section_roster(file_path: str, engine, section_number: int) -> int:
                     existing_codes.add(student.student_code.casefold())
                     students_by_name[name_lower] = student
                 imported += 1
-            elif by_email is not None or by_name is not None:
-                n_info = f"name={by_name.name}/{by_name.student_code or '?'}/sec{by_name.section_number}" if by_name else "no name match"
-                e_info = f"email={by_email.name}/{by_email.student_code or '?'}/sec{by_email.section_number}" if by_email else "no email match"
-                conflicts.append(f"Row {idx}: '{name}' / '{email}' matched by {n_info} and {e_info} but not to the same student")
-            else:
+            elif row['action'] == 'add':
                 code = generate_student_code(name, existing_codes)
                 student = Student(name=name, email=email, student_code=code, section_number=section_number)
                 session.add(student)
@@ -128,11 +293,6 @@ def import_section_roster(file_path: str, engine, section_number: int) -> int:
                 students_by_email[email_lower] = student
                 students_by_name[name_lower] = student
                 imported += 1
-
-        if conflicts:
-            print(f"Roster import conflicts for section {section_number}:")
-            for msg in conflicts:
-                print("  " + msg)
 
         # Report current-section students who are not in the imported roster.
         current_students = session.query(Student).filter_by(section_number=section_number).all()
@@ -151,4 +311,8 @@ def import_section_roster(file_path: str, engine, section_number: int) -> int:
                           f"not in imported roster; not listed in any other section")
 
         session.commit()
-    return imported
+
+    return {
+        'imported': imported,
+        'conflicts': analysis['conflicts'],
+    }
