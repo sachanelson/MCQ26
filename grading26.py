@@ -14,6 +14,7 @@ import os
 import re
 import json
 import logging
+import threading
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1174,6 +1175,45 @@ def _extract_and_collate_quant_pages(
     return [str(out_path)]
 
 
+def _start_quant_transcription(results: List[GradingResult], scan_path: str,
+                               grading_dir: str) -> Optional[threading.Thread]:
+    """Transcribe the extracted Quant handwriting in a background thread.
+
+    Writes `extracted_quant/quant_transcription.md` (one section per quiz)
+    when an LLM API key is configured; see quant_transcription26.py.
+
+    CURRENTLY UNUSED: the calls in record_results are commented out.  Quant
+    pages are read by the instructor from extracted_quant/quant_pages.pdf.
+    Re-enable those calls (and configure ~/.mcq26/llm_config.json) to get an
+    LLM-generated transcription of the handwritten answers as a reading aid.
+    """
+    try:
+        from quant_transcription26 import (
+            OUTPUT_NAME, quizzes_from_results, resolve_backend, transcribe_quizzes,
+        )
+        provider, _, api_key = resolve_backend()
+        if not api_key:
+            logger.info(f'Quant transcription skipped: no {provider} API key configured')
+            return None
+        quizzes = quizzes_from_results(results, scan_path)
+        if not quizzes:
+            return None
+        out_path = Path(grading_dir) / 'extracted_quant' / OUTPUT_NAME
+
+        def run():
+            try:
+                transcribe_quizzes(quizzes, out_path, title=Path(grading_dir).name)
+            except Exception:
+                logger.exception('Quant transcription failed')
+
+        thread = threading.Thread(target=run, name='quant-transcription')
+        thread.start()
+        return thread
+    except Exception:
+        logger.exception('Could not start Quant transcription')
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Artifact persistence for regrade
 # ---------------------------------------------------------------------------
@@ -1925,6 +1965,9 @@ def record_results(
 
         if extract_quant and scan_path:
             _extract_and_collate_quant_pages(ordered, scan_path, grading_dir, single_sides)
+            # Disabled for now (see _start_quant_transcription):
+            # if _extract_and_collate_quant_pages(ordered, scan_path, grading_dir, single_sides):
+            #     _start_quant_transcription(ordered, scan_path, grading_dir)
         if course_folder:
             _collate_quant_answer_keys(ordered, course_folder, grading_dir)
         _write_replacement_list(ordered, grading_dir, engine)
@@ -1965,6 +2008,9 @@ def record_results(
 
     if extract_quant and scan_path:
         _extract_and_collate_quant_pages(ordered, scan_path, grading_dir, single_sides)
+        # Disabled for now (see _start_quant_transcription):
+        # if _extract_and_collate_quant_pages(ordered, scan_path, grading_dir, single_sides):
+        #     _start_quant_transcription(ordered, scan_path, grading_dir)
     if course_folder:
         _collate_quant_answer_keys(ordered, course_folder, grading_dir)
     _write_replacement_list(ordered, grading_dir, engine)
