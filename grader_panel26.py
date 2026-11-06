@@ -21,7 +21,7 @@ from database26 import (
     get_quiz_score_by_quiz_id, get_student_by_code, student_name_sort_key,
 )
 from grading26 import (
-    ComponentScore, GradingResult, build_replacement_packet, parse_scan_file,
+    ComponentScore, GradingResult, build_replacement_packet, find_prior_grading, parse_scan_file,
     is_spare_student_code, needs_transfer_review,
     record_grading_result, record_results, rescore_result, resolve_held_up_result,
     save_grading_artifacts,
@@ -397,7 +397,7 @@ class GraderPanel(QWidget):
                 self._resolve_reading_issues(result)
             if not result.held_up and not result.resolved_as_quant and not result.resolved_as_blank:
                 rescore_result(result, forced_correct_ids)
-                if not result.has_quant:
+                if not self._warn_if_duplicate_quiz(result) and not result.has_quant:
                     self._confirm_overwrite_if_needed(result)
 
         recorded = record_results(
@@ -618,6 +618,55 @@ class GraderPanel(QWidget):
                 result.student_answers[question_number] = []
             else:
                 result.student_answers[question_number] = [choice]
+
+    def _warn_if_duplicate_quiz(self, result) -> bool:
+        """Warn when this quiz ID was already graded in an earlier session.
+
+        Either the same sheet was rescanned or a second copy of the same
+        quiz ID was taken; both replace the earlier record. Returns True if
+        the warning was shown (the grader's choice is final).
+        """
+        prior = find_prior_grading(self.engine, result)
+        if prior is None:
+            return False
+
+        earlier = f"score {prior['score'] if prior['score'] is not None else 'none'}"
+        if prior['quant_points_earned'] is not None:
+            earlier += f", Quant {prior['quant_points_earned']:g}/{prior['quant_total_points']:g}"
+        differing = prior['differing_questions']
+        if differing is None:
+            comparison = 'The earlier answers could not be found for comparison.'
+        elif differing:
+            comparison = (
+                'The answers differ on question(s) '
+                f"{', '.join(str(n) for n in differing)}, so this may be a DIFFERENT "
+                'copy of the same quiz (duplicate quiz ID).'
+            )
+        else:
+            comparison = 'The answers match the earlier scan, so this is probably a rescan of the same sheet.'
+        new_score = (
+            'pending Quant' if result.has_quant else str(round(result.total_score))
+        )
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle('Quiz Already Graded')
+        box.setText(
+            f"Quiz {result.quiz_id} ({prior['student_name'] or result.student_code}) was already "
+            f"graded in session {prior['session_label']} (taken {prior['date_taken'] or '?'}): "
+            f"{earlier}.\n\n{comparison}\n\n"
+            f'This scan: score {new_score}. There is one record per quiz ID, so recording '
+            'this scan replaces the earlier record (including its stored Quant score). '
+            'If the new score equals the earlier one, no new feedback email is generated.'
+        )
+        record_button = box.addButton('Record This Scan', QMessageBox.ButtonRole.AcceptRole)
+        skip_button = box.addButton('Skip This Scan', QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(skip_button)
+        box.setEscapeButton(skip_button)
+        box.exec()
+        if box.clickedButton() is not record_button:
+            result.overwrite_declined = True
+        return True
 
     def _confirm_overwrite_if_needed(self, result):
         """Ask before overwriting a quiz that was already graded with a different score.

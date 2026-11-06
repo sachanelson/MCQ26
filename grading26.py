@@ -29,6 +29,7 @@ from pypdf import PdfReader, PdfWriter
 from database26 import (
     create_db_engine,
     get_course_info,
+    get_grading_session,
     get_quiz_by_id,
     get_quiz_questions,
     get_quizzes_for_student,
@@ -104,6 +105,65 @@ def needs_transfer_review(engine, student_code: Optional[str]) -> bool:
         return True
     student = get_student_by_code(engine, student_code)
     return student is None or not student.enrolled
+
+
+def _normalized_answers(answers) -> Dict[int, List[str]]:
+    normalized = {}
+    for number, value in (answers or {}).items():
+        values = [value] if isinstance(value, str) else list(value or [])
+        normalized[int(number)] = sorted(v for v in values if v)
+    return normalized
+
+
+def find_prior_grading(engine, result: 'GradingResult') -> Optional[Dict[str, Any]]:
+    """Describe an earlier grading of *result*'s quiz ID from another session.
+
+    There is one Quiz row per quiz ID, so recording a second scan of the
+    same ID replaces the earlier attempt. Returns None when the quiz was
+    never graded or was graded in this same session. Otherwise returns the
+    earlier session/score and ``differing_questions``: question numbers
+    whose answers differ from the earlier scan (empty list = same answers,
+    i.e. likely a rescan of the same sheet; None = earlier answers unknown).
+    """
+    quiz = get_quiz_by_id(engine, result.quiz_id)
+    if not quiz or quiz['grading_session_id'] is None:
+        return None
+    if quiz['grading_session_id'] == result.grading_session_id:
+        return None
+    if quiz['score'] is None and quiz['mcq_points_earned'] is None:
+        return None
+
+    session = get_grading_session(engine, quiz['grading_session_id']) or {}
+    session_dir = Path(session['scan_path']) if session.get('scan_path') else None
+    differing = None
+    if session_dir is not None:
+        root = session_dir if session_dir.is_dir() else session_dir.parent
+        artifact = next(root.rglob(f'{result.quiz_id}_results.json'), None)
+        if artifact is not None:
+            try:
+                with open(artifact, 'r', encoding='utf-8') as file:
+                    earlier = _normalized_answers(json.load(file).get('student_answers'))
+                current = _normalized_answers(result.student_answers)
+                differing = sorted(
+                    n for n in set(earlier) | set(current)
+                    if earlier.get(n, []) != current.get(n, [])
+                )
+            except (OSError, ValueError):
+                logger.exception(f'Could not read earlier artifact {artifact}')
+
+    return {
+        'session_label': (
+            f"{session.get('session_date', '')}{session.get('letter', '')}"
+            or f"session {quiz['grading_session_id']}"
+        ),
+        'score': quiz['score'],
+        'date_taken': quiz['date_taken'],
+        'date_graded': quiz['date_graded'],
+        'quant_points_earned': quiz['quant_points_earned'],
+        'quant_total_points': quiz['quant_total_points'],
+        'student_name': (quiz.get('student') or {}).get('name', ''),
+        'differing_questions': differing,
+    }
 
 
 def _save_first_page_image(pages, page_images, grading_dir, quiz_id) -> Optional[str]:
