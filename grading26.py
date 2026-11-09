@@ -2065,6 +2065,8 @@ def record_results(
             recorded.append(quiz)
             if send_feedback:
                 _send_feedback_if_enabled(engine, result)
+                result.feedback_sent = True
+                result.feedback_pending = False
 
     if extract_quant and scan_path:
         _extract_and_collate_quant_pages(ordered, scan_path, grading_dir, single_sides)
