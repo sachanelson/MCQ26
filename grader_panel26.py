@@ -2,6 +2,7 @@ from dataclasses import replace
 from datetime import datetime
 import os
 import pickle
+import shutil
 import traceback
 from pathlib import Path
 
@@ -292,17 +293,18 @@ class GraderPanel(QWidget):
             QMessageBox.critical(self, 'Could Not Start Grading Session', str(error))
             return
 
-        processing_path = scan_files[0]
-        if len(scan_files) > 1:
-            processing_path = str(Path(session_info['directory']) / 'combined_scan.pdf')
-            try:
+        processing_path = str(Path(session_info['directory']) / 'combined_scan.pdf')
+        try:
+            if len(scan_files) > 1:
                 self._combine_scan_files(scan_files, processing_path)
-            except Exception as error:
-                traceback.print_exc()
-                QMessageBox.critical(self, 'Could Not Combine Scans', str(error))
-                if TEST_MODE:
-                    clear_grading_sessions(self.engine)
-                return
+            else:
+                shutil.copy2(scan_files[0], processing_path)
+        except Exception as error:
+            traceback.print_exc()
+            QMessageBox.critical(self, 'Could Not Save Scan to Session Folder', str(error))
+            if TEST_MODE:
+                clear_grading_sessions(self.engine)
+            return
 
         all_results = []
         all_recorded = []

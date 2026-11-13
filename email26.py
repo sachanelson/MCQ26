@@ -22,6 +22,7 @@ from database26 import (
     queue_outgoing_email, update_outgoing_email_status,
 )
 from token_refresh26 import get_gmail_service
+import gmail_accounts26
 
 logger = logging.getLogger(__name__)
 TEST_FEEDBACK_RECIPIENT = 'nelson@brandeis.edu'
@@ -282,10 +283,20 @@ def generate_and_queue_quiz_feedback(
     }
 
 
+def get_feedback_service():
+    """Gmail service for the feedback account (Accounts tab), else legacy token.json."""
+    account = gmail_accounts26.get_account('feedback')
+    if account:
+        return gmail_accounts26.get_service(account)
+    return get_gmail_service()
+
+
 def send_queued_email(engine, email_id: int, recipient: str, subject: str, body: str, email_type: str) -> bool:
-    service = get_gmail_service()
+    service = get_feedback_service()
     if service is None:
-        update_outgoing_email_status(engine, email_id, 'failed', 'Unable to create Gmail service')
+        account = gmail_accounts26.get_account('feedback') or 'token.json'
+        update_outgoing_email_status(engine, email_id, 'failed',
+                                     f'Unable to create Gmail service ({account} not signed in)')
         return False
     if send_email(service, recipient, subject, body, email_type=email_type):
         update_outgoing_email_status(engine, email_id, 'sent')

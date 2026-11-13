@@ -1,7 +1,7 @@
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, QDialog,
-    QTextEdit, QLineEdit, QFormLayout, QDialogButtonBox,
+    QTextEdit, QLineEdit, QFormLayout, QDialogButtonBox, QTabWidget,
 )
 from PyQt6.QtCore import Qt
 
@@ -9,6 +9,9 @@ from database26 import (
     delete_outgoing_email, get_outgoing_emails, update_outgoing_email,
 )
 from email26 import send_queued_email
+from email_accounts_panel26 import EmailAccountsPanel, ensure_service
+from scan_download_panel26 import ScanDownloadPanel
+import gmail_accounts26
 
 
 class EmailManagementPanel(QWidget):
@@ -19,7 +22,18 @@ class EmailManagementPanel(QWidget):
         self._refresh_emails()
 
     def _init_ui(self):
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.tabs = QTabWidget()
+        outer.addWidget(self.tabs)
+        outgoing = QWidget()
+        self.tabs.addTab(outgoing, 'Outgoing Emails')
+        self.scan_download_panel = ScanDownloadPanel(self)
+        self.tabs.addTab(self.scan_download_panel, 'Scan Download')
+        self.accounts_panel = EmailAccountsPanel(self)
+        self.tabs.addTab(self.accounts_panel, 'Accounts')
+
+        layout = QVBoxLayout(outgoing)
         controls = QHBoxLayout()
         refresh_button = QPushButton('Refresh')
         refresh_button.clicked.connect(self._refresh_emails)
@@ -169,6 +183,10 @@ class EmailManagementPanel(QWidget):
         if not emails:
             QMessageBox.warning(self, 'No Queued Email Selected', 'Select one or more queued emails to send.')
             return
+        if gmail_accounts26.get_account('feedback'):
+            _account, service = ensure_service(self, 'feedback')
+            if service is None:
+                return
         failed = []
         for email in emails:
             if not send_queued_email(
